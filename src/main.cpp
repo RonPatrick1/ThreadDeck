@@ -20,6 +20,7 @@
 #include <gtkmm/entry.h>
 #include <gtkmm/filechooserdialog.h>
 #include <gtkmm/headerbar.h>
+#include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <gtkmm/menubutton.h>
 #include <gtkmm/paned.h>
@@ -31,12 +32,14 @@
 #include <gtkmm/window.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -166,9 +169,6 @@ public:
           body_(Gtk::ORIENTATION_HORIZONTAL),
           workspace_(Gtk::ORIENTATION_HORIZONTAL),
           sidebar_(Gtk::ORIENTATION_VERTICAL),
-          folder_button_("Select Folder"),
-          new_thread_button_("New Thread"),
-          context_toggle_button_("Details"),
           send_button_("↑"),
           selected_folder_("No folder selected"),
           status_label_("Codex: starting"),
@@ -194,6 +194,11 @@ public:
             "Show or hide the contextual inspector");
         context_toggle_button_.get_style_context()->add_class(
             "context-toggle-button");
+
+        folder_button_.set_tooltip_text(
+            "Open project folder");
+        new_thread_button_.set_tooltip_text(
+            "Create a new thread");
 
         send_button_.signal_clicked().connect(
             sigc::mem_fun(*this, &MainWindow::submit_prompt));
@@ -231,6 +236,30 @@ public:
         theme_selector_.append(
             "neutral-dark",
             "Neutral Dark");
+        theme_selector_.append(
+            "winter-frost",
+            "Winter Frost");
+        theme_selector_.append(
+            "spring-moss",
+            "Spring Moss");
+        theme_selector_.append(
+            "summer-coast",
+            "Summer Coast");
+        theme_selector_.append(
+            "autumn-ember",
+            "Autumn Ember");
+        theme_selector_.append(
+            "midnight-ocean",
+            "Midnight Ocean");
+        theme_selector_.append(
+            "forest-rain",
+            "Forest Rain");
+        theme_selector_.append(
+            "lavender-calm",
+            "Lavender Calm");
+        theme_selector_.append(
+            "storm-slate",
+            "Storm Slate");
         theme_selector_.set_tooltip_text(
             "ThreadDeck appearance");
         theme_selector_.get_style_context()->add_class(
@@ -247,19 +276,66 @@ public:
             "Quit",
             "app.quit");
 
-        hamburger_button_.set_label("☰");
+        hamburger_image_.set_from_icon_name(
+            "open-menu-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        folder_image_.set_from_icon_name(
+            "folder-open-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        new_thread_image_.set_from_icon_name(
+            "document-new-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        context_image_.set_from_icon_name(
+            "view-sidebar-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+
+        hamburger_button_.set_image(
+            hamburger_image_);
+        folder_button_.set_image(
+            folder_image_);
+        new_thread_button_.set_image(
+            new_thread_image_);
+        context_toggle_button_.set_image(
+            context_image_);
+
+        hamburger_button_.set_always_show_image(true);
+        folder_button_.set_always_show_image(true);
+        new_thread_button_.set_always_show_image(true);
+        context_toggle_button_.set_always_show_image(true);
+
         hamburger_button_.set_tooltip_text(
             "ThreadDeck menu");
-        hamburger_button_.set_relief(
-            Gtk::RELIEF_NONE);
+        hamburger_button_.property_use_popover() =
+            false;
         hamburger_button_.set_menu_model(
             app_menu_model_);
+
+        for (
+            Gtk::Button* button :
+            {
+                static_cast<Gtk::Button*>(
+                    &hamburger_button_),
+                &folder_button_,
+                &new_thread_button_,
+                static_cast<Gtk::Button*>(
+                    &context_toggle_button_),
+            }
+        ) {
+            button->set_relief(
+                Gtk::RELIEF_NONE);
+            button->set_size_request(
+                36,
+                36);
+            button->get_style_context()->add_class(
+                "compact-header-button");
+        }
+
         hamburger_button_.get_style_context()->add_class(
             "app-menu-button");
 
         header_.pack_start(hamburger_button_);
         header_.pack_start(folder_button_);
-        header_.pack_end(new_thread_button_);
+        header_.pack_start(new_thread_button_);
         header_.pack_end(context_toggle_button_);
 
         selected_folder_.set_xalign(0.0F);
@@ -309,6 +385,10 @@ public:
 
         prompt_.get_buffer()->set_text("");
         prompt_.set_name("prompt-input");
+        prompt_.set_sensitive(true);
+        prompt_.set_editable(true);
+        prompt_.set_cursor_visible(true);
+        prompt_.set_can_focus(true);
         prompt_.set_wrap_mode(Gtk::WRAP_WORD_CHAR);
         prompt_.set_left_margin(4);
         prompt_.set_right_margin(4);
@@ -468,6 +548,7 @@ private:
         current_thread_default_label_.clear();
         current_thread_data_ =
             nlohmann::json::object();
+        current_thread_turn_failed_ = false;
 
         thread_header_.clear();
         context_panel_.clear();
@@ -701,11 +782,7 @@ private:
                     240,
                     600);
 
-            if (
-                theme_id_ != "system" &&
-                theme_id_ != "neutral-light" &&
-                theme_id_ != "neutral-dark"
-            ) {
+            if (!is_known_theme_id(theme_id_)) {
                 theme_id_ = "system";
             }
 
@@ -1375,11 +1452,20 @@ headerbar.threaddeck-header {
     background-color: alpha(@theme_selected_bg_color, 0.22);
 }
 
-.app-menu-button {
-    min-width: 38px;
-    min-height: 34px;
-    padding: 0 8px;
-    font-size: 20px;
+.compact-header-button {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    border-radius: 7px;
+}
+
+.compact-header-button:hover {
+    background-color: alpha(@theme_fg_color, 0.08);
+}
+
+.compact-header-button:active,
+.compact-header-button:checked {
+    background-color: alpha(@theme_selected_bg_color, 0.22);
 }
 
 .settings-root {
@@ -1430,6 +1516,7 @@ headerbar.threaddeck-header {
 #prompt-input,
 #prompt-input text {
     background-color: transparent;
+    color: @theme_text_color;
     border: none;
     box-shadow: none;
 }
@@ -1505,230 +1592,434 @@ headerbar.threaddeck-header {
             "send-button");
     }
 
+    struct ThemePalette {
+        const char* id;
+        const char* accent_color;
+        const char* accent_bg_color;
+        const char* accent_fg_color;
+        const char* window_bg_color;
+        const char* view_bg_color;
+        const char* headerbar_bg_color;
+        const char* sidebar_bg_color;
+        const char* card_bg_color;
+        const char* popover_bg_color;
+        const char* dialog_bg_color;
+        const char* foreground_color;
+        const char* shade_color;
+        const char* scrollbar_outline_color;
+    };
+
+    const ThemePalette* find_theme_palette(
+        const std::string& theme_id
+    ) const {
+        static const std::array<
+            ThemePalette,
+            10
+        > palettes{{
+            ThemePalette{
+                "neutral-light",
+                "#3f6f98",
+                "#4b82b1",
+                "#ffffff",
+                "#f3f4f5",
+                "#ffffff",
+                "#e7e9eb",
+                "#eceeef",
+                "#ffffff",
+                "#ffffff",
+                "#f3f4f5",
+                "#202327",
+                "rgba(24, 28, 32, 0.14)",
+                "rgba(24, 28, 32, 0.24)",
+            },
+            ThemePalette{
+                "neutral-dark",
+                "#83b6e4",
+                "#3f78a8",
+                "#ffffff",
+                "#202226",
+                "#181a1d",
+                "#292c31",
+                "#24272b",
+                "#2d3036",
+                "#2d3036",
+                "#202226",
+                "#f1f3f5",
+                "rgba(0, 0, 0, 0.48)",
+                "rgba(255, 255, 255, 0.18)",
+            },
+            ThemePalette{
+                "winter-frost",
+                "#547f99",
+                "#5d8eaa",
+                "#ffffff",
+                "#edf3f7",
+                "#f9fcfd",
+                "#dfeaf1",
+                "#e6eef3",
+                "#ffffff",
+                "#ffffff",
+                "#edf3f7",
+                "#263743",
+                "rgba(47, 78, 97, 0.16)",
+                "rgba(47, 78, 97, 0.26)",
+            },
+            ThemePalette{
+                "spring-moss",
+                "#607c57",
+                "#6f8f63",
+                "#ffffff",
+                "#eef2ea",
+                "#fafcf7",
+                "#e1e8dc",
+                "#e7ece2",
+                "#fcfdfb",
+                "#fcfdfb",
+                "#eef2ea",
+                "#293429",
+                "rgba(50, 72, 48, 0.16)",
+                "rgba(50, 72, 48, 0.26)",
+            },
+            ThemePalette{
+                "summer-coast",
+                "#367679",
+                "#42898d",
+                "#ffffff",
+                "#eaf4f4",
+                "#f9fdfd",
+                "#dcecec",
+                "#e3f0f0",
+                "#ffffff",
+                "#ffffff",
+                "#eaf4f4",
+                "#203637",
+                "rgba(41, 85, 87, 0.16)",
+                "rgba(41, 85, 87, 0.26)",
+            },
+            ThemePalette{
+                "autumn-ember",
+                "#e0a06f",
+                "#a85f34",
+                "#ffffff",
+                "#2a221e",
+                "#211b18",
+                "#352a24",
+                "#302721",
+                "#3a2e27",
+                "#3a2e27",
+                "#2a221e",
+                "#f3e9e2",
+                "rgba(0, 0, 0, 0.50)",
+                "rgba(243, 233, 226, 0.18)",
+            },
+            ThemePalette{
+                "midnight-ocean",
+                "#82b4e0",
+                "#3b73a5",
+                "#ffffff",
+                "#171d29",
+                "#111722",
+                "#202839",
+                "#1c2433",
+                "#263045",
+                "#263045",
+                "#171d29",
+                "#eef4fb",
+                "rgba(0, 0, 0, 0.52)",
+                "rgba(238, 244, 251, 0.18)",
+            },
+            ThemePalette{
+                "forest-rain",
+                "#88b99d",
+                "#4f7d63",
+                "#ffffff",
+                "#18231f",
+                "#111a17",
+                "#213029",
+                "#1d2a25",
+                "#27382f",
+                "#27382f",
+                "#18231f",
+                "#edf5f0",
+                "rgba(0, 0, 0, 0.50)",
+                "rgba(237, 245, 240, 0.18)",
+            },
+            ThemePalette{
+                "lavender-calm",
+                "#725f98",
+                "#806da5",
+                "#ffffff",
+                "#f1eef6",
+                "#fbf9fd",
+                "#e6e0ef",
+                "#ebe6f2",
+                "#ffffff",
+                "#ffffff",
+                "#f1eef6",
+                "#332d3e",
+                "rgba(71, 55, 94, 0.16)",
+                "rgba(71, 55, 94, 0.26)",
+            },
+            ThemePalette{
+                "storm-slate",
+                "#9bb1c8",
+                "#617c98",
+                "#ffffff",
+                "#23272e",
+                "#1a1e24",
+                "#2d323b",
+                "#282d35",
+                "#343a44",
+                "#343a44",
+                "#23272e",
+                "#eef1f5",
+                "rgba(0, 0, 0, 0.48)",
+                "rgba(238, 241, 245, 0.18)",
+            }
+        }};
+
+        for (const auto& palette : palettes) {
+            if (theme_id == palette.id) {
+                return &palette;
+            }
+        }
+
+        return nullptr;
+    }
+
+    bool is_known_theme_id(
+        const std::string& theme_id
+    ) const {
+        return (
+            theme_id == "system" ||
+            find_theme_palette(theme_id) != nullptr
+        );
+    }
+
     std::string theme_css(
         const std::string& theme_id
     ) const {
-        if (theme_id == "neutral-light") {
-            return R"CSS(
-window {
-    background-color: #f4f4f2;
-    color: #202124;
-}
+        const ThemePalette* palette =
+            find_theme_palette(theme_id);
 
-headerbar.threaddeck-header {
-    background-image: none;
-    background-color: #e9e9e6;
-    color: #202124;
-    border-color: #cdcdc8;
-}
-
-.context-strip {
-    background-color: #efefec;
-    color: #4f5255;
-    border-color: #d7d7d2;
-}
-
-.threaddeck-sidebar,
-.settings-sidebar {
-    background-color: #e7e7e3;
-    color: #202124;
-    border-color: #cacac5;
-}
-
-.threaddeck-content,
-.settings-root,
-.settings-page,
-.thread-header {
-    background-color: #f4f4f2;
-    color: #202124;
-}
-
-.context-panel {
-    background-color: #ecece8;
-    color: #202124;
-    border-color: #cacac5;
-}
-
-.thread-folder-chip {
-    background-color: #e1e1dc;
-    color: #3d4145;
-}
-
-#transcript-scroll,
-#transcript-view,
-#transcript-view text {
-    background-color: #fbfbf9;
-    color: #202124;
-}
-
-.composer {
-    background-color: #ffffff;
-    border-color: #c7c7c2;
-}
-
-menu,
-popover,
-dialog {
-    background-color: #fbfbf9;
-    color: #202124;
-}
-
-button,
-combobox button {
-    background-image: none;
-    background-color: #f2f2ef;
-    color: #202124;
-    border-color: #c8c8c3;
-}
-
-button:hover,
-combobox button:hover,
-menuitem:hover {
-    background-color: #e2e6eb;
-}
-
-button:active,
-button:checked,
-combobox button:active {
-    background-color: #d5dbe3;
-}
-
-.thread-row:hover {
-    background-color: #dfe3e8;
-}
-
-.thread-row.active-thread {
-    background-color: #cfd9e7;
-    color: #17263a;
-}
-
-.send-button {
-    background-color: #356aa0;
-    color: #ffffff;
-}
-
-.send-button:hover {
-    background-color: #4079b2;
-}
-
-selection {
-    background-color: #356aa0;
-    color: #ffffff;
-}
-)CSS";
+        if (!palette) {
+            return {};
         }
 
-        if (theme_id == "neutral-dark") {
-            return R"CSS(
-window {
-    background-color: #242526;
-    color: #e8e8e8;
-}
+        std::ostringstream css;
 
-headerbar.threaddeck-header {
-    background-image: none;
-    background-color: #2d2e30;
-    color: #f0f0f0;
-    border-color: #424447;
-}
+        css
+            << "window {\n"
+            << "    background-color: "
+            << palette->window_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-.context-strip {
-    background-color: #292a2c;
-    color: #b9bcc1;
-    border-color: #3c3e41;
-}
+            << "headerbar.threaddeck-header {\n"
+            << "    background-image: none;\n"
+            << "    background-color: "
+            << palette->headerbar_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->shade_color
+            << ";\n"
+            << "}\n\n"
 
-.threaddeck-sidebar,
-.settings-sidebar {
-    background-color: #202123;
-    color: #e8e8e8;
-    border-color: #3a3c3f;
-}
+            << ".context-strip {\n"
+            << "    background-color: "
+            << palette->window_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->shade_color
+            << ";\n"
+            << "}\n\n"
 
-.threaddeck-content,
-.settings-root,
-.settings-page,
-.thread-header {
-    background-color: #28292b;
-    color: #e8e8e8;
-}
+            << ".threaddeck-sidebar,\n"
+            << ".settings-sidebar {\n"
+            << "    background-color: "
+            << palette->sidebar_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->shade_color
+            << ";\n"
+            << "}\n\n"
 
-.context-panel {
-    background-color: #222325;
-    color: #e8e8e8;
-    border-color: #3a3c3f;
-}
+            << ".threaddeck-content,\n"
+            << ".settings-root,\n"
+            << ".settings-page,\n"
+            << ".thread-header {\n"
+            << "    background-color: "
+            << palette->window_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-.thread-folder-chip {
-    background-color: #3a3c3f;
-    color: #d6d8dc;
-}
+            << "#transcript-scroll,\n"
+            << "#transcript-view,\n"
+            << "#transcript-view text {\n"
+            << "    background-color: "
+            << palette->view_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-#transcript-scroll,
-#transcript-view,
-#transcript-view text {
-    background-color: #2f3032;
-    color: #ededed;
-}
+            << ".composer {\n"
+            << "    background-color: "
+            << palette->card_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n\n"
 
-.composer {
-    background-color: #363739;
-    border-color: #55585c;
-}
+            << "#prompt-scroll,\n"
+            << "#prompt-input,\n"
+            << "#prompt-input text {\n"
+            << "    background-color: transparent;\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-menu,
-popover,
-dialog {
-    background-color: #303133;
-    color: #ededed;
-}
+            << ".context-panel {\n"
+            << "    background-color: "
+            << palette->sidebar_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->shade_color
+            << ";\n"
+            << "}\n\n"
 
-button,
-combobox button {
-    background-image: none;
-    background-color: #383a3d;
-    color: #ededed;
-    border-color: #55585c;
-}
+            << ".thread-folder-chip {\n"
+            << "    background-color: "
+            << palette->card_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-button:hover,
-combobox button:hover,
-menuitem:hover {
-    background-color: #474a4e;
-}
+            << "menu,\n"
+            << "popover,\n"
+            << "dialog {\n"
+            << "    background-color: "
+            << palette->popover_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-button:active,
-button:checked,
-combobox button:active {
-    background-color: #52565b;
-}
+            << "dialog {\n"
+            << "    background-color: "
+            << palette->dialog_bg_color
+            << ";\n"
+            << "}\n\n"
 
-.thread-row:hover {
-    background-color: #35383c;
-}
+            << "button,\n"
+            << "combobox button {\n"
+            << "    background-image: none;\n"
+            << "    background-color: "
+            << palette->card_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n\n"
 
-.thread-row.active-thread {
-    background-color: #364b63;
-    color: #ffffff;
-}
+            << "button:hover,\n"
+            << "combobox button:hover,\n"
+            << "menuitem:hover {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.20);\n"
+            << "}\n\n"
 
-.send-button {
-    background-color: #4d7fb3;
-    color: #ffffff;
-}
+            << "button:active,\n"
+            << "button:checked,\n"
+            << "combobox button:active {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.32);\n"
+            << "}\n\n"
 
-.send-button:hover {
-    background-color: #5a8fc4;
-}
+            << ".thread-row:hover {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.18);\n"
+            << "}\n\n"
 
-selection {
-    background-color: #4d7fb3;
-    color: #ffffff;
-}
-)CSS";
-        }
+            << ".thread-row.active-thread {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.34);\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "}\n\n"
 
-        return {};
+            << ".send-button {\n"
+            << "    background-color: "
+            << palette->accent_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->accent_fg_color
+            << ";\n"
+            << "}\n\n"
+
+            << ".send-button:hover {\n"
+            << "    background-color: "
+            << palette->accent_color
+            << ";\n"
+            << "}\n\n"
+
+            << "selection {\n"
+            << "    background-color: "
+            << palette->accent_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->accent_fg_color
+            << ";\n"
+            << "}\n\n"
+
+            << "scrollbar slider {\n"
+            << "    background-color: alpha("
+            << palette->foreground_color
+            << ", 0.28);\n"
+            << "}\n\n"
+
+            << "scrollbar trough {\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n";
+
+        return css.str();
     }
 
     void apply_theme(bool persist_selection) {
@@ -1794,11 +2085,7 @@ selection {
             return;
         }
 
-        if (
-            selected != "system" &&
-            selected != "neutral-light" &&
-            selected != "neutral-dark"
-        ) {
+        if (!is_known_theme_id(selected)) {
             std::cerr
                 << "FAIL: rejected unknown ThreadDeck theme "
                 << selected
@@ -2479,11 +2766,17 @@ selection {
                 !current_thread_id_.empty() &&
                 !current_thread_was_listed
             ) {
+                const std::string pending_label =
+                    current_thread_turn_failed_
+                        ? "● Current thread - turn failed "
+                          "(not saved)"
+                        : "● Current thread "
+                          "(not saved yet)";
+
                 auto* pending_button =
                     Gtk::manage(
                         new Gtk::Button(
-                            "● New thread "
-                            "(not saved yet)"));
+                            pending_label));
 
                 pending_button->set_relief(
                     Gtk::RELIEF_NONE);
@@ -2896,6 +3189,7 @@ selection {
 
         last_active_thread_cwd_ =
             resumed_cwd;
+        current_thread_turn_failed_ = false;
 
         set_active_thread_surfaces(
             display_thread_label(
@@ -3065,6 +3359,7 @@ selection {
         last_active_thread_id_ = result.thread_id;
         last_active_thread_cwd_ =
             selected_folder_path_;
+        current_thread_turn_failed_ = false;
 
         set_active_thread_surfaces(
             "New Thread",
@@ -3072,7 +3367,12 @@ selection {
             current_thread_id_);
 
         status_label_.set_text("Codex: connected");
-        prompt_.grab_focus();
+
+        prompt_.set_sensitive(true);
+        prompt_.set_editable(true);
+        prompt_.set_cursor_visible(true);
+        prompt_.set_can_focus(true);
+        prompt_.get_buffer()->set_text("");
         update_send_button_state();
 
         transcript_.get_buffer()->set_text(
@@ -3085,6 +3385,7 @@ selection {
 
         save_ui_state();
         refresh_sidebar_threads();
+        prompt_.grab_focus();
 
         std::cout
             << "PASS: GTK created Codex thread "
@@ -3128,6 +3429,7 @@ selection {
             prompt_text);
 
         status_label_.set_text("Codex: working");
+        current_thread_turn_failed_ = false;
         set_turn_busy(true);
 
         std::cout
@@ -3178,6 +3480,8 @@ selection {
                 "Codex transport error:\n" +
                 result.error);
 
+            current_thread_turn_failed_ = true;
+
             std::cerr
                 << "FAIL: GTK turn transport: "
                 << result.error
@@ -3198,6 +3502,8 @@ selection {
                         : result.streamed_text));
 
         } else if (result.status == "failed") {
+            current_thread_turn_failed_ = true;
+
             status_label_.set_text(
                 "Codex: turn failed");
 
@@ -3303,6 +3609,11 @@ selection {
     ThreadHeader thread_header_;
     ContextPanel context_panel_;
 
+    Gtk::Image hamburger_image_;
+    Gtk::Image folder_image_;
+    Gtk::Image new_thread_image_;
+    Gtk::Image context_image_;
+
     Gtk::MenuButton hamburger_button_;
     Gtk::Button folder_button_;
     Gtk::Button new_thread_button_;
@@ -3338,6 +3649,7 @@ selection {
     bool context_panel_visible_{true};
     int context_panel_width_{320};
     bool turn_in_progress_{false};
+    bool current_thread_turn_failed_{false};
 
     std::vector<std::string>
         selected_project_folders_;
