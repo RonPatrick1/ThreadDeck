@@ -1,24 +1,34 @@
 #include "app_server_client.h"
+#include "context_panel.h"
+#include "thread_header.h"
 
 #include <nlohmann/json.hpp>
 
+#include <giomm/menu.h>
+#include <giomm/simpleaction.h>
 #include <gdk/gdkkeysyms.h>
 #include <gdkmm/screen.h>
 #include <glibmm/dispatcher.h>
 #include <glibmm/main.h>
+#include <gtkmm/aboutdialog.h>
 #include <gtkmm/application.h>
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
+#include <gtkmm/comboboxtext.h>
 #include <gtkmm/cssprovider.h>
 #include <gtkmm/entry.h>
 #include <gtkmm/filechooserdialog.h>
 #include <gtkmm/headerbar.h>
 #include <gtkmm/label.h>
+#include <gtkmm/menubutton.h>
 #include <gtkmm/paned.h>
 #include <gtkmm/scrolledwindow.h>
+#include <gtkmm/stack.h>
+#include <gtkmm/stacksidebar.h>
 #include <gtkmm/stylecontext.h>
 #include <gtkmm/textview.h>
+#include <gtkmm/window.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -32,24 +42,141 @@
 #include <utility>
 #include <vector>
 
+class SettingsWindow final : public Gtk::Window {
+public:
+    explicit SettingsWindow(
+        Gtk::ComboBoxText& theme_selector
+    )
+        : root_(Gtk::ORIENTATION_HORIZONTAL),
+          appearance_page_(Gtk::ORIENTATION_VERTICAL),
+          theme_selector_(theme_selector),
+          appearance_title_("Appearance"),
+          theme_label_("Theme"),
+          theme_description_(
+              "Choose whether ThreadDeck follows the current "
+              "GTK system appearance or uses a controlled "
+              "built-in palette.") {
+        set_title("ThreadDeck Settings");
+        set_default_size(620, 420);
+        set_modal(false);
+
+        root_.get_style_context()->add_class(
+            "settings-root");
+
+        category_sidebar_.get_style_context()->add_class(
+            "settings-sidebar");
+        category_sidebar_.set_size_request(170, -1);
+        category_sidebar_.set_stack(settings_stack_);
+
+        settings_stack_.get_style_context()->add_class(
+            "settings-page");
+        settings_stack_.set_hexpand(true);
+        settings_stack_.set_vexpand(true);
+        settings_stack_.set_transition_type(
+            Gtk::STACK_TRANSITION_TYPE_CROSSFADE);
+        settings_stack_.set_transition_duration(150);
+
+        appearance_page_.get_style_context()->add_class(
+            "settings-page");
+        appearance_page_.set_border_width(22);
+        appearance_page_.set_spacing(14);
+
+        appearance_title_.set_xalign(0.0F);
+        appearance_title_.set_markup(
+            "<span size=\"x-large\" weight=\"bold\">"
+            "Appearance"
+            "</span>");
+
+        theme_label_.set_xalign(0.0F);
+        theme_label_.set_markup(
+            "<b>Theme</b>");
+
+        theme_description_.set_xalign(0.0F);
+        theme_description_.set_line_wrap(true);
+        theme_description_.set_max_width_chars(54);
+
+        theme_selector_.set_hexpand(false);
+        theme_selector_.set_halign(Gtk::ALIGN_START);
+
+        appearance_page_.pack_start(
+            appearance_title_,
+            Gtk::PACK_SHRINK);
+        appearance_page_.pack_start(
+            theme_label_,
+            Gtk::PACK_SHRINK);
+        appearance_page_.pack_start(
+            theme_description_,
+            Gtk::PACK_SHRINK);
+        appearance_page_.pack_start(
+            theme_selector_,
+            Gtk::PACK_SHRINK);
+
+        settings_stack_.add(
+            appearance_page_,
+            "appearance",
+            "Appearance");
+
+        root_.pack_start(
+            category_sidebar_,
+            Gtk::PACK_SHRINK);
+        root_.pack_start(
+            settings_stack_,
+            Gtk::PACK_EXPAND_WIDGET);
+
+        add(root_);
+
+        signal_delete_event().connect(
+            sigc::mem_fun(
+                *this,
+                &SettingsWindow::handle_delete),
+            false);
+
+        show_all_children();
+    }
+
+    void present_for(Gtk::Window& parent) {
+        set_transient_for(parent);
+        set_position(Gtk::WIN_POS_CENTER_ON_PARENT);
+        show_all();
+        present();
+    }
+
+private:
+    bool handle_delete(GdkEventAny*) {
+        hide();
+        return true;
+    }
+
+    Gtk::Box root_;
+    Gtk::StackSidebar category_sidebar_;
+    Gtk::Stack settings_stack_;
+    Gtk::Box appearance_page_;
+
+    Gtk::ComboBoxText& theme_selector_;
+
+    Gtk::Label appearance_title_;
+    Gtk::Label theme_label_;
+    Gtk::Label theme_description_;
+};
+
 class MainWindow final : public Gtk::ApplicationWindow {
 public:
     MainWindow()
         : root_(Gtk::ORIENTATION_VERTICAL),
           body_(Gtk::ORIENTATION_HORIZONTAL),
+          workspace_(Gtk::ORIENTATION_HORIZONTAL),
           sidebar_(Gtk::ORIENTATION_VERTICAL),
           folder_button_("Select Folder"),
           new_thread_button_("New Thread"),
+          context_toggle_button_("Details"),
           send_button_("↑"),
           selected_folder_("No folder selected"),
           status_label_("Codex: starting"),
-          sidebar_title_("Threads"),
-          current_thread_label_("No active thread") {
+          sidebar_title_("Threads") {
         set_title("ThreadDeck");
         set_default_size(1200, 760);
 
         header_.set_title("ThreadDeck");
-        header_.set_subtitle("Native GTK 3 client");
         header_.set_show_close_button(true);
         set_titlebar(header_);
 
@@ -62,6 +189,11 @@ public:
             sigc::mem_fun(
                 *this,
                 &MainWindow::create_thread_for_selected_folder));
+
+        context_toggle_button_.set_tooltip_text(
+            "Show or hide the contextual inspector");
+        context_toggle_button_.get_style_context()->add_class(
+            "context-toggle-button");
 
         send_button_.signal_clicked().connect(
             sigc::mem_fun(*this, &MainWindow::submit_prompt));
@@ -90,8 +222,45 @@ public:
         send_button_.set_valign(Gtk::ALIGN_END);
         send_button_.set_tooltip_text("Send message (Enter)");
 
+        theme_selector_.append(
+            "system",
+            "System");
+        theme_selector_.append(
+            "neutral-light",
+            "Neutral Light");
+        theme_selector_.append(
+            "neutral-dark",
+            "Neutral Dark");
+        theme_selector_.set_tooltip_text(
+            "ThreadDeck appearance");
+        theme_selector_.get_style_context()->add_class(
+            "theme-selector");
+
+        app_menu_model_ = Gio::Menu::create();
+        app_menu_model_->append(
+            "Settings",
+            "app.settings");
+        app_menu_model_->append(
+            "About ThreadDeck",
+            "app.about");
+        app_menu_model_->append(
+            "Quit",
+            "app.quit");
+
+        hamburger_button_.set_label("☰");
+        hamburger_button_.set_tooltip_text(
+            "ThreadDeck menu");
+        hamburger_button_.set_relief(
+            Gtk::RELIEF_NONE);
+        hamburger_button_.set_menu_model(
+            app_menu_model_);
+        hamburger_button_.get_style_context()->add_class(
+            "app-menu-button");
+
+        header_.pack_start(hamburger_button_);
         header_.pack_start(folder_button_);
         header_.pack_end(new_thread_button_);
+        header_.pack_end(context_toggle_button_);
 
         selected_folder_.set_xalign(0.0F);
         selected_folder_.set_ellipsize(Pango::ELLIPSIZE_MIDDLE);
@@ -100,17 +269,25 @@ public:
         status_label_.set_xalign(0.0F);
         root_.pack_start(status_label_, Gtk::PACK_SHRINK);
 
+        header_.get_style_context()->add_class(
+            "threaddeck-header");
+        selected_folder_.get_style_context()->add_class(
+            "context-strip");
+        status_label_.get_style_context()->add_class(
+            "context-strip");
+        sidebar_.get_style_context()->add_class(
+            "threaddeck-sidebar");
+        content_.get_style_context()->add_class(
+            "threaddeck-content");
+        transcript_scroll_.set_name(
+            "transcript-scroll");
+        transcript_.set_name(
+            "transcript-view");
+
         sidebar_title_.set_xalign(0.0F);
         sidebar_.set_border_width(12);
         sidebar_.set_spacing(8);
         sidebar_.pack_start(sidebar_title_, Gtk::PACK_SHRINK);
-
-        current_thread_label_.set_xalign(0.0F);
-        current_thread_label_.set_line_wrap(true);
-        current_thread_label_.set_selectable(true);
-        sidebar_.pack_start(
-            current_thread_label_,
-            Gtk::PACK_SHRINK);
 
         sidebar_list_.set_spacing(4);
         sidebar_scroll_.set_policy(
@@ -152,6 +329,9 @@ public:
         content_.set_spacing(8);
         content_.set_border_width(8);
         content_.pack_start(
+            thread_header_,
+            Gtk::PACK_SHRINK);
+        content_.pack_start(
             transcript_scroll_,
             Gtk::PACK_EXPAND_WIDGET);
 
@@ -168,13 +348,32 @@ public:
             composer_,
             Gtk::PACK_SHRINK);
 
+        workspace_.pack1(content_, true, false);
+        workspace_.pack2(context_panel_, false, false);
+        workspace_.set_position(620);
+
         body_.pack1(sidebar_, false, false);
-        body_.pack2(content_, true, false);
+        body_.pack2(workspace_, true, false);
         body_.set_position(260);
 
         root_.pack_start(body_, Gtk::PACK_EXPAND_WIDGET);
 
         load_ui_state();
+
+        theme_selector_.set_active_id(
+            theme_id_);
+        theme_selector_.signal_changed().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_theme_changed));
+
+        context_toggle_button_.set_active(
+            context_panel_visible_);
+        context_toggle_button_.signal_toggled().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_context_panel_toggled));
+
         apply_main_window_state();
 
         signal_configure_event().connect(
@@ -195,10 +394,12 @@ public:
                 &MainWindow::handle_main_window_delete),
             false);
 
-        configure_composer_style();
+        configure_styles();
+        apply_theme(false);
         update_prompt_height();
         initialize_app_server();
         show_all_children();
+        apply_context_panel_visibility(false);
     }
 
     ~MainWindow() override {
@@ -208,6 +409,194 @@ public:
     }
 
 private:
+public:
+    void show_settings() {
+        settings_window_.present_for(*this);
+    }
+
+    void show_about() {
+        Gtk::AboutDialog dialog;
+
+        dialog.set_transient_for(*this);
+        dialog.set_modal(true);
+        dialog.set_program_name("ThreadDeck");
+        dialog.set_version("0.1.0");
+        dialog.set_comments(
+            "A native desktop client for Codex on Linux.");
+        dialog.set_copyright(
+            "Copyright © 2026 Ron Patrick");
+
+        dialog.run();
+    }
+
+private:
+    std::string folder_name_from_path(
+        const std::string& path
+    ) const {
+        if (path.empty()) {
+            return "No folder";
+        }
+
+        const auto normalized =
+            std::filesystem::path(path).lexically_normal();
+
+        const std::string name =
+            normalized.filename().string();
+
+        return name.empty()
+            ? path
+            : name;
+    }
+
+    std::string project_display_name(
+        const std::string& cwd
+    ) const {
+        const auto label =
+            folder_labels_.find(cwd);
+
+        if (
+            label != folder_labels_.end() &&
+            !label->second.empty()
+        ) {
+            return label->second;
+        }
+
+        return folder_name_from_path(cwd);
+    }
+
+    void clear_active_thread_surfaces() {
+        current_thread_default_label_.clear();
+        current_thread_data_ =
+            nlohmann::json::object();
+
+        thread_header_.clear();
+        context_panel_.clear();
+    }
+
+    void refresh_active_thread_surfaces_from_labels() {
+        if (current_thread_id_.empty()) {
+            clear_active_thread_surfaces();
+            return;
+        }
+
+        std::string title =
+            current_thread_default_label_;
+
+        if (
+            current_thread_data_.is_object() &&
+            !current_thread_data_.empty()
+        ) {
+            title =
+                display_thread_label(
+                    current_thread_data_);
+        } else {
+            const auto custom_label =
+                thread_labels_.find(
+                    current_thread_id_);
+
+            if (
+                custom_label != thread_labels_.end() &&
+                !custom_label->second.empty()
+            ) {
+                title = custom_label->second;
+            }
+        }
+
+        if (title.empty()) {
+            title = "New Thread";
+        }
+
+        const std::string cwd =
+            !last_active_thread_cwd_.empty()
+                ? last_active_thread_cwd_
+                : selected_folder_path_;
+
+        thread_header_.set_thread(
+            title,
+            cwd);
+
+        context_panel_.set_details(
+            title,
+            project_display_name(cwd),
+            folder_name_from_path(cwd),
+            cwd,
+            current_thread_id_);
+    }
+
+    void set_active_thread_surfaces(
+        const std::string& default_label,
+        const std::string& cwd,
+        const std::string& thread_id,
+        const nlohmann::json& thread_data =
+            nlohmann::json::object()
+    ) {
+        current_thread_default_label_ =
+            default_label;
+        current_thread_data_ =
+            thread_data;
+        last_active_thread_cwd_ =
+            cwd;
+        current_thread_id_ =
+            thread_id;
+
+        refresh_active_thread_surfaces_from_labels();
+    }
+
+    void apply_context_panel_visibility(
+        bool persist
+    ) {
+        if (context_panel_visible_) {
+            context_panel_.show();
+
+            const int allocated_width =
+                workspace_.get_allocated_width();
+
+            if (allocated_width > 560) {
+                workspace_.set_position(
+                    allocated_width -
+                    std::clamp(
+                        context_panel_width_,
+                        240,
+                        600));
+            }
+        } else {
+            context_panel_.hide();
+        }
+
+        if (persist) {
+            save_ui_state();
+        }
+    }
+
+    void handle_context_panel_toggled() {
+        if (
+            context_panel_visible_ &&
+            !context_toggle_button_.get_active()
+        ) {
+            const int allocated_width =
+                workspace_.get_allocated_width();
+            const int divider_position =
+                workspace_.get_position();
+
+            if (
+                allocated_width > divider_position &&
+                divider_position > 0
+            ) {
+                context_panel_width_ =
+                    std::clamp(
+                        allocated_width -
+                            divider_position,
+                        240,
+                        600);
+            }
+        }
+
+        context_panel_visible_ =
+            context_toggle_button_.get_active();
+
+        apply_context_panel_visibility(true);
+    }
+
     std::filesystem::path ui_state_path() const {
         const char* xdg_config_home =
             std::getenv("XDG_CONFIG_HOME");
@@ -293,6 +682,32 @@ private:
                 state.value(
                     "activeThreadCwd",
                     std::string{});
+
+            theme_id_ =
+                state.value(
+                    "theme",
+                    std::string{"system"});
+
+            context_panel_visible_ =
+                state.value(
+                    "contextPanelVisible",
+                    true);
+
+            context_panel_width_ =
+                std::clamp(
+                    state.value(
+                        "contextPanelWidth",
+                        320),
+                    240,
+                    600);
+
+            if (
+                theme_id_ != "system" &&
+                theme_id_ != "neutral-light" &&
+                theme_id_ != "neutral-dark"
+            ) {
+                theme_id_ = "system";
+            }
 
             selected_project_folders_.clear();
 
@@ -415,6 +830,28 @@ private:
             std::filesystem::create_directories(
                 state_path.parent_path());
 
+            int saved_context_panel_width =
+                context_panel_width_;
+
+            if (context_panel_visible_) {
+                const int allocated_width =
+                    workspace_.get_allocated_width();
+                const int divider_position =
+                    workspace_.get_position();
+
+                if (
+                    allocated_width > divider_position &&
+                    divider_position > 0
+                ) {
+                    saved_context_panel_width =
+                        std::clamp(
+                            allocated_width -
+                                divider_position,
+                            240,
+                            600);
+                }
+            }
+
             const nlohmann::json state = {
                 {
                     "hasGeometry",
@@ -452,6 +889,18 @@ private:
                 {
                     "activeThreadCwd",
                     last_active_thread_cwd_,
+                },
+                {
+                    "theme",
+                    theme_id_,
+                },
+                {
+                    "contextPanelVisible",
+                    context_panel_visible_,
+                },
+                {
+                    "contextPanelWidth",
+                    saved_context_panel_width,
                 },
                 {
                     "mainWindow",
@@ -877,10 +1326,99 @@ private:
         save_ui_state();
     }
 
-    void configure_composer_style() {
-        css_provider_ = Gtk::CssProvider::create();
+    void configure_styles() {
+        structural_css_provider_ =
+            Gtk::CssProvider::create();
 
-        css_provider_->load_from_data(R"CSS(
+        structural_css_provider_->load_from_data(R"CSS(
+headerbar.threaddeck-header {
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.16);
+}
+
+.thread-header {
+    background-color: @theme_bg_color;
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.14);
+    padding: 10px 12px;
+}
+
+.thread-header-title {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.thread-folder-chip {
+    background-color: alpha(@theme_fg_color, 0.08);
+    border-radius: 8px;
+    padding: 4px 9px;
+}
+
+.context-panel {
+    background-color: shade(@theme_bg_color, 0.97);
+    border-left: 1px solid alpha(@theme_fg_color, 0.14);
+}
+
+.context-panel-title {
+    font-size: 17px;
+    font-weight: bold;
+}
+
+.details-key {
+    opacity: 0.70;
+    font-weight: bold;
+}
+
+.details-value {
+    padding-bottom: 7px;
+}
+
+.context-toggle-button:checked {
+    background-color: alpha(@theme_selected_bg_color, 0.22);
+}
+
+.app-menu-button {
+    min-width: 38px;
+    min-height: 34px;
+    padding: 0 8px;
+    font-size: 20px;
+}
+
+.settings-root {
+    background-color: @theme_bg_color;
+}
+
+.settings-sidebar {
+    background-color: shade(@theme_bg_color, 0.96);
+    border-right: 1px solid alpha(@theme_fg_color, 0.14);
+}
+
+.settings-page {
+    background-color: @theme_bg_color;
+}
+
+.context-strip {
+    background-color: shade(@theme_bg_color, 0.98);
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.10);
+    padding: 4px 10px;
+}
+
+.threaddeck-sidebar {
+    background-color: shade(@theme_bg_color, 0.96);
+    border-right: 1px solid alpha(@theme_fg_color, 0.14);
+}
+
+.threaddeck-content {
+    background-color: @theme_bg_color;
+}
+
+#transcript-scroll,
+#transcript-view,
+#transcript-view text {
+    background-color: @theme_base_color;
+    color: @theme_text_color;
+    border: none;
+    box-shadow: none;
+}
+
 .composer {
     background-color: @theme_base_color;
     border: 1px solid alpha(@theme_fg_color, 0.22);
@@ -917,6 +1455,10 @@ private:
     opacity: 0.42;
 }
 
+.theme-selector {
+    min-width: 128px;
+}
+
 .folder-heading {
     font-weight: bold;
     margin-top: 10px;
@@ -925,9 +1467,15 @@ private:
 
 .thread-row {
     padding: 5px 7px;
+    border-radius: 6px;
+}
+
+.thread-row:hover {
+    background-color: alpha(@theme_fg_color, 0.07);
 }
 
 .thread-row.active-thread {
+    background-color: alpha(@theme_selected_bg_color, 0.22);
     font-weight: bold;
 }
 
@@ -943,17 +1491,323 @@ private:
 }
 )CSS");
 
-        const auto screen = Gdk::Screen::get_default();
+        const auto screen =
+            Gdk::Screen::get_default();
 
         if (screen) {
             Gtk::StyleContext::add_provider_for_screen(
                 screen,
-                css_provider_,
+                structural_css_provider_,
                 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
 
         send_button_.get_style_context()->add_class(
             "send-button");
+    }
+
+    std::string theme_css(
+        const std::string& theme_id
+    ) const {
+        if (theme_id == "neutral-light") {
+            return R"CSS(
+window {
+    background-color: #f4f4f2;
+    color: #202124;
+}
+
+headerbar.threaddeck-header {
+    background-image: none;
+    background-color: #e9e9e6;
+    color: #202124;
+    border-color: #cdcdc8;
+}
+
+.context-strip {
+    background-color: #efefec;
+    color: #4f5255;
+    border-color: #d7d7d2;
+}
+
+.threaddeck-sidebar,
+.settings-sidebar {
+    background-color: #e7e7e3;
+    color: #202124;
+    border-color: #cacac5;
+}
+
+.threaddeck-content,
+.settings-root,
+.settings-page,
+.thread-header {
+    background-color: #f4f4f2;
+    color: #202124;
+}
+
+.context-panel {
+    background-color: #ecece8;
+    color: #202124;
+    border-color: #cacac5;
+}
+
+.thread-folder-chip {
+    background-color: #e1e1dc;
+    color: #3d4145;
+}
+
+#transcript-scroll,
+#transcript-view,
+#transcript-view text {
+    background-color: #fbfbf9;
+    color: #202124;
+}
+
+.composer {
+    background-color: #ffffff;
+    border-color: #c7c7c2;
+}
+
+menu,
+popover,
+dialog {
+    background-color: #fbfbf9;
+    color: #202124;
+}
+
+button,
+combobox button {
+    background-image: none;
+    background-color: #f2f2ef;
+    color: #202124;
+    border-color: #c8c8c3;
+}
+
+button:hover,
+combobox button:hover,
+menuitem:hover {
+    background-color: #e2e6eb;
+}
+
+button:active,
+button:checked,
+combobox button:active {
+    background-color: #d5dbe3;
+}
+
+.thread-row:hover {
+    background-color: #dfe3e8;
+}
+
+.thread-row.active-thread {
+    background-color: #cfd9e7;
+    color: #17263a;
+}
+
+.send-button {
+    background-color: #356aa0;
+    color: #ffffff;
+}
+
+.send-button:hover {
+    background-color: #4079b2;
+}
+
+selection {
+    background-color: #356aa0;
+    color: #ffffff;
+}
+)CSS";
+        }
+
+        if (theme_id == "neutral-dark") {
+            return R"CSS(
+window {
+    background-color: #242526;
+    color: #e8e8e8;
+}
+
+headerbar.threaddeck-header {
+    background-image: none;
+    background-color: #2d2e30;
+    color: #f0f0f0;
+    border-color: #424447;
+}
+
+.context-strip {
+    background-color: #292a2c;
+    color: #b9bcc1;
+    border-color: #3c3e41;
+}
+
+.threaddeck-sidebar,
+.settings-sidebar {
+    background-color: #202123;
+    color: #e8e8e8;
+    border-color: #3a3c3f;
+}
+
+.threaddeck-content,
+.settings-root,
+.settings-page,
+.thread-header {
+    background-color: #28292b;
+    color: #e8e8e8;
+}
+
+.context-panel {
+    background-color: #222325;
+    color: #e8e8e8;
+    border-color: #3a3c3f;
+}
+
+.thread-folder-chip {
+    background-color: #3a3c3f;
+    color: #d6d8dc;
+}
+
+#transcript-scroll,
+#transcript-view,
+#transcript-view text {
+    background-color: #2f3032;
+    color: #ededed;
+}
+
+.composer {
+    background-color: #363739;
+    border-color: #55585c;
+}
+
+menu,
+popover,
+dialog {
+    background-color: #303133;
+    color: #ededed;
+}
+
+button,
+combobox button {
+    background-image: none;
+    background-color: #383a3d;
+    color: #ededed;
+    border-color: #55585c;
+}
+
+button:hover,
+combobox button:hover,
+menuitem:hover {
+    background-color: #474a4e;
+}
+
+button:active,
+button:checked,
+combobox button:active {
+    background-color: #52565b;
+}
+
+.thread-row:hover {
+    background-color: #35383c;
+}
+
+.thread-row.active-thread {
+    background-color: #364b63;
+    color: #ffffff;
+}
+
+.send-button {
+    background-color: #4d7fb3;
+    color: #ffffff;
+}
+
+.send-button:hover {
+    background-color: #5a8fc4;
+}
+
+selection {
+    background-color: #4d7fb3;
+    color: #ffffff;
+}
+)CSS";
+        }
+
+        return {};
+    }
+
+    void apply_theme(bool persist_selection) {
+        const auto screen =
+            Gdk::Screen::get_default();
+
+        if (
+            screen &&
+            theme_css_provider_
+        ) {
+            Gtk::StyleContext::remove_provider_for_screen(
+                screen,
+                theme_css_provider_);
+
+            theme_css_provider_ =
+                Glib::RefPtr<Gtk::CssProvider>();
+        }
+
+        const std::string css =
+            theme_css(theme_id_);
+
+        if (
+            screen &&
+            !css.empty()
+        ) {
+            theme_css_provider_ =
+                Gtk::CssProvider::create();
+
+            theme_css_provider_->load_from_data(
+                css);
+
+            Gtk::StyleContext::add_provider_for_screen(
+                screen,
+                theme_css_provider_,
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+        }
+
+        queue_draw();
+
+        if (persist_selection) {
+            save_ui_state();
+        }
+
+        std::cout
+            << "PASS: applied ThreadDeck theme "
+            << theme_id_
+            << (
+                css.empty()
+                    ? " using the current GTK system palette"
+                    : " using a controlled built-in palette"
+            )
+            << '\n';
+    }
+
+    void handle_theme_changed() {
+        const std::string selected =
+            theme_selector_.get_active_id().raw();
+
+        if (
+            selected.empty() ||
+            selected == theme_id_
+        ) {
+            return;
+        }
+
+        if (
+            selected != "system" &&
+            selected != "neutral-light" &&
+            selected != "neutral-dark"
+        ) {
+            std::cerr
+                << "FAIL: rejected unknown ThreadDeck theme "
+                << selected
+                << '\n';
+            return;
+        }
+
+        theme_id_ = selected;
+        apply_theme(true);
     }
 
     bool on_prompt_key_press(GdkEventKey* event) {
@@ -1297,6 +2151,8 @@ private:
     }
 
     void refresh_sidebar_threads() {
+        refresh_active_thread_surfaces_from_labels();
+
         clear_sidebar_list();
 
         Gtk::Entry* editor_to_focus = nullptr;
@@ -2002,8 +2858,7 @@ private:
                 last_active_thread_id_.clear();
                 last_active_thread_cwd_.clear();
 
-                current_thread_label_.set_text(
-                    "No active thread");
+                clear_active_thread_surfaces();
 
                 transcript_.get_buffer()->set_text(
                     "The previously active Codex thread "
@@ -2042,10 +2897,12 @@ private:
         last_active_thread_cwd_ =
             resumed_cwd;
 
-        current_thread_label_.set_text(
-            "Active thread:\n" +
+        set_active_thread_surfaces(
             display_thread_label(
-                result.thread));
+                result.thread),
+            resumed_cwd,
+            result.thread_id,
+            result.thread);
 
         render_thread_transcript(
             result.thread);
@@ -2189,8 +3046,7 @@ private:
         if (!result.success) {
             current_thread_id_.clear();
 
-            current_thread_label_.set_text(
-                "No active thread");
+            clear_active_thread_surfaces();
 
             status_label_.set_text(
                 "Codex: thread creation failed");
@@ -2210,8 +3066,9 @@ private:
         last_active_thread_cwd_ =
             selected_folder_path_;
 
-        current_thread_label_.set_text(
-            "Active thread:\n" +
+        set_active_thread_surfaces(
+            "New Thread",
+            selected_folder_path_,
             current_thread_id_);
 
         status_label_.set_text("Codex: connected");
@@ -2414,8 +3271,7 @@ private:
             last_active_thread_id_.clear();
             last_active_thread_cwd_.clear();
 
-            current_thread_label_.set_text(
-                "No active thread");
+            clear_active_thread_surfaces();
 
             transcript_.get_buffer()->set_text(
                 "Project folder selected.\n\n"
@@ -2439,18 +3295,27 @@ private:
     Gtk::HeaderBar header_;
     Gtk::Box root_;
     Gtk::Paned body_;
+    Gtk::Paned workspace_;
     Gtk::Box sidebar_;
     Gtk::Box content_{Gtk::ORIENTATION_VERTICAL};
     Gtk::Box composer_{Gtk::ORIENTATION_HORIZONTAL};
 
+    ThreadHeader thread_header_;
+    ContextPanel context_panel_;
+
+    Gtk::MenuButton hamburger_button_;
     Gtk::Button folder_button_;
     Gtk::Button new_thread_button_;
+    Gtk::ToggleButton context_toggle_button_;
     Gtk::Button send_button_;
+    Gtk::ComboBoxText theme_selector_;
+    SettingsWindow settings_window_{theme_selector_};
+
+    Glib::RefPtr<Gio::Menu> app_menu_model_;
 
     Gtk::Label selected_folder_;
     Gtk::Label status_label_;
     Gtk::Label sidebar_title_;
-    Gtk::Label current_thread_label_;
 
     Gtk::ScrolledWindow sidebar_scroll_;
     Gtk::Box sidebar_list_{
@@ -2465,6 +3330,13 @@ private:
     std::string current_thread_id_;
     std::string last_active_thread_id_;
     std::string last_active_thread_cwd_;
+    std::string current_thread_default_label_;
+    nlohmann::json current_thread_data_ =
+        nlohmann::json::object();
+    std::string theme_id_{"system"};
+
+    bool context_panel_visible_{true};
+    int context_panel_width_{320};
     bool turn_in_progress_{false};
 
     std::vector<std::string>
@@ -2497,7 +3369,11 @@ private:
 
     AppServerClient app_server_;
 
-    Glib::RefPtr<Gtk::CssProvider> css_provider_;
+    Glib::RefPtr<Gtk::CssProvider>
+        structural_css_provider_;
+    Glib::RefPtr<Gtk::CssProvider>
+        theme_css_provider_;
+
     Glib::Dispatcher turn_dispatcher_;
     std::thread turn_worker_;
     std::mutex turn_result_mutex_;
@@ -2511,5 +3387,36 @@ int main(int argc, char* argv[]) {
         "com.ronpatrick.ThreadDeck");
 
     MainWindow window;
+
+    const auto settings_action =
+        Gio::SimpleAction::create("settings");
+
+    settings_action->signal_activate().connect(
+        [&window](const Glib::VariantBase&) {
+            window.show_settings();
+        });
+
+    application->add_action(settings_action);
+
+    const auto about_action =
+        Gio::SimpleAction::create("about");
+
+    about_action->signal_activate().connect(
+        [&window](const Glib::VariantBase&) {
+            window.show_about();
+        });
+
+    application->add_action(about_action);
+
+    const auto quit_action =
+        Gio::SimpleAction::create("quit");
+
+    quit_action->signal_activate().connect(
+        [application](const Glib::VariantBase&) {
+            application->quit();
+        });
+
+    application->add_action(quit_action);
+
     return application->run(window);
 }

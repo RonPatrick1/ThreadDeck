@@ -49,6 +49,8 @@ target_compile_options(codex-app-server-client
 
 add_executable(threaddeck
     src/main.cpp
+    src/context_panel.cpp
+    src/thread_header.cpp
 )
 
 target_link_libraries(threaddeck
