@@ -190,6 +190,11 @@ public:
                 *this,
                 &MainWindow::create_thread_for_selected_folder));
 
+        sidebar_toggle_button_.signal_toggled().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_sidebar_toggled));
+
         context_toggle_button_.set_tooltip_text(
             "Show or hide the contextual inspector");
         context_toggle_button_.get_style_context()->add_class(
@@ -279,6 +284,9 @@ public:
         hamburger_image_.set_from_icon_name(
             "open-menu-symbolic",
             Gtk::ICON_SIZE_BUTTON);
+        sidebar_image_.set_from_icon_name(
+            "sidebar-hide-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
         folder_image_.set_from_icon_name(
             "folder-open-symbolic",
             Gtk::ICON_SIZE_BUTTON);
@@ -291,6 +299,8 @@ public:
 
         hamburger_button_.set_image(
             hamburger_image_);
+        sidebar_toggle_button_.set_image(
+            sidebar_image_);
         folder_button_.set_image(
             folder_image_);
         new_thread_button_.set_image(
@@ -299,6 +309,7 @@ public:
             context_image_);
 
         hamburger_button_.set_always_show_image(true);
+        sidebar_toggle_button_.set_always_show_image(true);
         folder_button_.set_always_show_image(true);
         new_thread_button_.set_always_show_image(true);
         context_toggle_button_.set_always_show_image(true);
@@ -315,6 +326,8 @@ public:
             {
                 static_cast<Gtk::Button*>(
                     &hamburger_button_),
+                static_cast<Gtk::Button*>(
+                    &sidebar_toggle_button_),
                 &folder_button_,
                 &new_thread_button_,
                 static_cast<Gtk::Button*>(
@@ -334,6 +347,7 @@ public:
             "app-menu-button");
 
         header_.pack_start(hamburger_button_);
+        header_.pack_start(sidebar_toggle_button_);
         header_.pack_start(folder_button_);
         header_.pack_start(new_thread_button_);
         header_.pack_end(context_toggle_button_);
@@ -447,6 +461,9 @@ public:
                 *this,
                 &MainWindow::handle_theme_changed));
 
+        sidebar_toggle_button_.set_active(
+            sidebar_visible_);
+
         context_toggle_button_.set_active(
             context_panel_visible_);
         context_toggle_button_.signal_toggled().connect(
@@ -479,6 +496,7 @@ public:
         update_prompt_height();
         initialize_app_server();
         show_all_children();
+        apply_sidebar_visibility(false);
         apply_context_panel_visibility(false);
     }
 
@@ -621,6 +639,80 @@ private:
             thread_id;
 
         refresh_active_thread_surfaces_from_labels();
+    }
+
+    void update_sidebar_toggle_visuals() {
+        sidebar_image_.set_from_icon_name(
+            sidebar_visible_
+                ? "sidebar-hide-symbolic"
+                : "sidebar-show-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+
+        sidebar_toggle_button_.set_tooltip_text(
+            sidebar_visible_
+                ? "Hide projects and threads"
+                : "Show projects and threads");
+    }
+
+    void apply_sidebar_visibility(
+        bool persist
+    ) {
+        if (sidebar_visible_) {
+            sidebar_.show();
+
+            int restored_width =
+                std::clamp(
+                    sidebar_width_,
+                    180,
+                    600);
+
+            const int allocated_width =
+                body_.get_allocated_width();
+
+            if (allocated_width > 540) {
+                restored_width =
+                    std::min(
+                        restored_width,
+                        allocated_width - 360);
+            }
+
+            body_.set_position(
+                std::max(
+                    180,
+                    restored_width));
+        } else {
+            sidebar_.hide();
+            body_.set_position(0);
+        }
+
+        update_sidebar_toggle_visuals();
+
+        if (persist) {
+            save_ui_state();
+        }
+    }
+
+    void handle_sidebar_toggled() {
+        if (
+            sidebar_visible_ &&
+            !sidebar_toggle_button_.get_active()
+        ) {
+            const int divider_position =
+                body_.get_position();
+
+            if (divider_position > 0) {
+                sidebar_width_ =
+                    std::clamp(
+                        divider_position,
+                        180,
+                        600);
+            }
+        }
+
+        sidebar_visible_ =
+            sidebar_toggle_button_.get_active();
+
+        apply_sidebar_visibility(true);
     }
 
     void apply_context_panel_visibility(
@@ -769,6 +861,19 @@ private:
                     "theme",
                     std::string{"system"});
 
+            sidebar_visible_ =
+                state.value(
+                    "sidebarVisible",
+                    true);
+
+            sidebar_width_ =
+                std::clamp(
+                    state.value(
+                        "sidebarWidth",
+                        260),
+                    180,
+                    600);
+
             context_panel_visible_ =
                 state.value(
                     "contextPanelVisible",
@@ -907,6 +1012,22 @@ private:
             std::filesystem::create_directories(
                 state_path.parent_path());
 
+            int saved_sidebar_width =
+                sidebar_width_;
+
+            if (sidebar_visible_) {
+                const int divider_position =
+                    body_.get_position();
+
+                if (divider_position > 0) {
+                    saved_sidebar_width =
+                        std::clamp(
+                            divider_position,
+                            180,
+                            600);
+                }
+            }
+
             int saved_context_panel_width =
                 context_panel_width_;
 
@@ -970,6 +1091,14 @@ private:
                 {
                     "theme",
                     theme_id_,
+                },
+                {
+                    "sidebarVisible",
+                    sidebar_visible_,
+                },
+                {
+                    "sidebarWidth",
+                    saved_sidebar_width,
                 },
                 {
                     "contextPanelVisible",
@@ -3610,11 +3739,13 @@ headerbar.threaddeck-header {
     ContextPanel context_panel_;
 
     Gtk::Image hamburger_image_;
+    Gtk::Image sidebar_image_;
     Gtk::Image folder_image_;
     Gtk::Image new_thread_image_;
     Gtk::Image context_image_;
 
     Gtk::MenuButton hamburger_button_;
+    Gtk::ToggleButton sidebar_toggle_button_;
     Gtk::Button folder_button_;
     Gtk::Button new_thread_button_;
     Gtk::ToggleButton context_toggle_button_;
@@ -3646,6 +3777,8 @@ headerbar.threaddeck-header {
         nlohmann::json::object();
     std::string theme_id_{"system"};
 
+    bool sidebar_visible_{true};
+    int sidebar_width_{260};
     bool context_panel_visible_{true};
     int context_panel_width_{320};
     bool turn_in_progress_{false};
