@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(CodexNativeUbuntu
+project(ThreadDeck
     VERSION 0.1.0
     LANGUAGES CXX
 )
@@ -47,34 +47,34 @@ target_compile_options(codex-app-server-client
         -Wpedantic
 )
 
-add_executable(codex-native-ubuntu
+add_executable(threaddeck
     src/main.cpp
 )
 
-target_link_libraries(codex-native-ubuntu
+target_link_libraries(threaddeck
     PRIVATE
         PkgConfig::GTKMM
         codex-app-server-client
         Threads::Threads
 )
 
-target_compile_options(codex-native-ubuntu
+target_compile_options(threaddeck
     PRIVATE
         -Wall
         -Wextra
         -Wpedantic
 )
 
-add_executable(codex-app-server-smoke
+add_executable(threaddeck-app-server-smoke
     src/app_server_smoke.cpp
 )
 
-target_link_libraries(codex-app-server-smoke
+target_link_libraries(threaddeck-app-server-smoke
     PRIVATE
         codex-app-server-client
 )
 
-target_compile_options(codex-app-server-smoke
+target_compile_options(threaddeck-app-server-smoke
     PRIVATE
         -Wall
         -Wextra

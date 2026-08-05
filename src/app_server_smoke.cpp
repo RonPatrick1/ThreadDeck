@@ -24,8 +24,8 @@ int main() {
 
     const auto initialize_result =
         client.initialize(
-            "codex-native-ubuntu",
-            "Codex Native Ubuntu",
+            "threaddeck",
+            "ThreadDeck",
             "0.1.0");
 
     if (!initialize_result.success) {

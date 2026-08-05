@@ -45,10 +45,10 @@ public:
           status_label_("Codex: starting"),
           sidebar_title_("Threads"),
           current_thread_label_("No active thread") {
-        set_title("Codex Native Ubuntu");
+        set_title("ThreadDeck");
         set_default_size(1200, 760);
 
-        header_.set_title("Codex Native Ubuntu");
+        header_.set_title("ThreadDeck");
         header_.set_subtitle("Native GTK 3 client");
         header_.set_show_close_button(true);
         set_titlebar(header_);
@@ -123,7 +123,7 @@ public:
             Gtk::PACK_EXPAND_WIDGET);
 
         transcript_.get_buffer()->set_text(
-            "Codex Native Ubuntu\n\n"
+            "ThreadDeck\n\n"
             "Select a folder to create a Codex thread.");
 
         transcript_.set_editable(false);
@@ -218,7 +218,7 @@ private:
         ) {
             return std::filesystem::path(
                 xdg_config_home
-            ) / "codex-native-ubuntu" / "ui-state.json";
+            ) / "threaddeck" / "ui-state.json";
         }
 
         const char* home = std::getenv("HOME");
@@ -227,12 +227,12 @@ private:
             return std::filesystem::path(
                 home
             ) / ".config" /
-                "codex-native-ubuntu" /
+                "threaddeck" /
                 "ui-state.json";
         }
 
         return std::filesystem::path(
-            ".codex-native-ubuntu-ui-state.json");
+            ".threaddeck-ui-state.json");
     }
 
     void load_ui_state() {
@@ -2099,8 +2099,8 @@ private:
         }
 
         const auto result = app_server_.initialize(
-            "codex-native-ubuntu",
-            "Codex Native Ubuntu",
+            "threaddeck",
+            "ThreadDeck",
             "0.1.0");
 
         if (!result.success) {
@@ -2508,7 +2508,7 @@ int main(int argc, char* argv[]) {
     const auto application = Gtk::Application::create(
         argc,
         argv,
-        "com.ronpatrick.CodexNativeUbuntu");
+        "com.ronpatrick.ThreadDeck");
 
     MainWindow window;
     return application->run(window);
