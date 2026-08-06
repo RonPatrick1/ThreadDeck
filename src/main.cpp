@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -169,7 +170,7 @@ public:
           body_(Gtk::ORIENTATION_HORIZONTAL),
           workspace_(Gtk::ORIENTATION_HORIZONTAL),
           sidebar_(Gtk::ORIENTATION_VERTICAL),
-          send_button_("↑"),
+          send_button_(),
           selected_folder_("No folder selected"),
           status_label_("Codex: starting"),
           sidebar_title_("Threads") {
@@ -206,12 +207,19 @@ public:
             "Create a new thread");
 
         send_button_.signal_clicked().connect(
-            sigc::mem_fun(*this, &MainWindow::submit_prompt));
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_send_or_stop));
 
         turn_dispatcher_.connect(
             sigc::mem_fun(
                 *this,
                 &MainWindow::handle_turn_finished));
+
+        turn_event_dispatcher_.connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_turn_events));
 
         prompt_.signal_key_press_event().connect(
             sigc::mem_fun(
@@ -227,6 +235,11 @@ public:
         new_thread_button_.set_sensitive(false);
         send_button_.set_sensitive(false);
 
+        send_image_.set_from_icon_name(
+            "mail-send-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        send_button_.set_image(send_image_);
+        send_button_.set_always_show_image(true);
         send_button_.set_relief(Gtk::RELIEF_NONE);
         send_button_.set_size_request(42, 42);
         send_button_.set_valign(Gtk::ALIGN_END);
@@ -2314,11 +2327,17 @@ headerbar.threaddeck-header {
     }
 
     void update_send_button_state() {
+        if (turn_in_progress_) {
+            send_button_.set_sensitive(
+                !active_turn_id_.empty() &&
+                !stop_requested_);
+            return;
+        }
+
         const std::string prompt_text = trim(
             prompt_.get_buffer()->get_text().raw());
 
         send_button_.set_sensitive(
-            !turn_in_progress_ &&
             !current_thread_id_.empty() &&
             !prompt_text.empty());
     }
@@ -3058,6 +3077,273 @@ headerbar.threaddeck-header {
         return rendered;
     }
 
+    static std::string activity_label(
+        const std::string& type
+    ) {
+        if (type == "commandExecution") {
+            return "Command execution";
+        }
+        if (type == "fileChange") {
+            return "File change";
+        }
+        if (type == "mcpToolCall") {
+            return "MCP tool call";
+        }
+        if (type == "dynamicToolCall") {
+            return "Tool call";
+        }
+        if (type == "collabAgentToolCall") {
+            return "Collaboration tool call";
+        }
+        if (type == "subAgentActivity") {
+            return "Sub-agent activity";
+        }
+        if (type == "webSearch") {
+            return "Web search";
+        }
+        if (type == "imageView") {
+            return "Image view";
+        }
+        if (type == "sleep") {
+            return "Waiting";
+        }
+        if (type == "imageGeneration") {
+            return "Image generation";
+        }
+        if (type == "contextCompaction") {
+            return "Context compaction";
+        }
+
+        return type.empty()
+            ? "Codex activity"
+            : type;
+    }
+
+    static bool is_activity_type(
+        const std::string& type
+    ) {
+        return
+            type == "commandExecution" ||
+            type == "fileChange" ||
+            type == "mcpToolCall" ||
+            type == "dynamicToolCall" ||
+            type == "collabAgentToolCall" ||
+            type == "subAgentActivity" ||
+            type == "webSearch" ||
+            type == "imageView" ||
+            type == "sleep" ||
+            type == "imageGeneration" ||
+            type == "contextCompaction";
+    }
+
+    static std::string activity_state(
+        const nlohmann::json& item,
+        const std::string& turn_status,
+        const std::string& fallback
+    ) {
+        const std::string status =
+            item.value("status", std::string{});
+
+        if (status == "inProgress") {
+            if (turn_status == "failed") {
+                return "failed";
+            }
+
+            if (turn_status == "interrupted") {
+                return "interrupted";
+            }
+
+            return "running";
+        }
+
+        if (!status.empty()) {
+            return status;
+        }
+
+        if (
+            turn_status == "failed" ||
+            turn_status == "interrupted"
+        ) {
+            return turn_status;
+        }
+
+        if (
+            item.value("type", std::string{}) ==
+            "subAgentActivity"
+        ) {
+            const std::string kind =
+                item.value("kind", std::string{});
+
+            if (!kind.empty()) {
+                return kind;
+            }
+        }
+
+        return fallback;
+    }
+
+    static std::string activity_detail(
+        const nlohmann::json& item
+    ) {
+        const std::string type =
+            item.value("type", std::string{});
+
+        if (type == "commandExecution") {
+            return item.value(
+                "command",
+                std::string{});
+        }
+
+        if (type == "fileChange") {
+            std::string paths;
+
+            const auto changes =
+                item.value(
+                    "changes",
+                    nlohmann::json::array());
+
+            if (changes.is_array()) {
+                for (const auto& change : changes) {
+                    if (!change.is_object()) {
+                        continue;
+                    }
+
+                    const std::string path =
+                        change.value(
+                            "path",
+                            std::string{});
+
+                    if (path.empty()) {
+                        continue;
+                    }
+
+                    if (!paths.empty()) {
+                        paths += ", ";
+                    }
+
+                    paths += path;
+                }
+            }
+
+            return paths;
+        }
+
+        if (type == "mcpToolCall") {
+            const std::string server =
+                item.value(
+                    "server",
+                    std::string{});
+
+            const std::string tool =
+                item.value(
+                    "tool",
+                    std::string{});
+
+            if (server.empty()) {
+                return tool;
+            }
+
+            if (tool.empty()) {
+                return server;
+            }
+
+            return server + "/" + tool;
+        }
+
+        if (type == "dynamicToolCall") {
+            std::string name_space;
+
+            if (
+                item.contains("namespace") &&
+                item["namespace"].is_string()
+            ) {
+                name_space =
+                    item["namespace"]
+                        .get<std::string>();
+            }
+
+            const std::string tool =
+                item.value(
+                    "tool",
+                    std::string{});
+
+            if (name_space.empty()) {
+                return tool;
+            }
+
+            if (tool.empty()) {
+                return name_space;
+            }
+
+            return name_space + "::" + tool;
+        }
+
+        if (type == "collabAgentToolCall") {
+            return item.value(
+                "tool",
+                std::string{});
+        }
+
+        if (type == "subAgentActivity") {
+            return item.value(
+                "agentPath",
+                std::string{});
+        }
+
+        if (type == "webSearch") {
+            return item.value(
+                "query",
+                std::string{});
+        }
+
+        if (type == "imageView") {
+            return item.value(
+                "path",
+                std::string{});
+        }
+
+        if (type == "imageGeneration") {
+            if (
+                item.contains("savedPath") &&
+                item["savedPath"].is_string()
+            ) {
+                return item["savedPath"]
+                    .get<std::string>();
+            }
+
+            return {};
+        }
+
+        return {};
+    }
+
+    static std::string render_activity(
+        const nlohmann::json& item,
+        const std::string& turn_status
+    ) {
+        std::string rendered =
+            "[" +
+            activity_state(
+                item,
+                turn_status,
+                "completed") +
+            "] " +
+            activity_label(
+                item.value(
+                    "type",
+                    std::string{}));
+
+        const std::string detail =
+            activity_detail(item);
+
+        if (!detail.empty()) {
+            rendered += ": ";
+            rendered += detail;
+        }
+
+        return rendered;
+    }
+
     void render_thread_transcript(
         const nlohmann::json& thread
     ) {
@@ -3078,6 +3364,13 @@ headerbar.threaddeck-header {
                 ) {
                     continue;
                 }
+
+                const std::string turn_status =
+                    turn.value(
+                        "status",
+                        std::string{});
+
+                bool rendered_agent_message = false;
 
                 for (
                     const auto& item :
@@ -3106,6 +3399,15 @@ headerbar.threaddeck-header {
                                     nlohmann::json::array())));
 
                     } else if (type == "agentMessage") {
+                        const std::string agent_text =
+                            item.value(
+                                "text",
+                                std::string{});
+
+                        if (!agent_text.empty()) {
+                            rendered_agent_message = true;
+                        }
+
                         const std::string phase =
                             item.value(
                                 "phase",
@@ -3118,9 +3420,7 @@ headerbar.threaddeck-header {
                                     ? "Codex commentary"
                                     : "Codex"
                             ),
-                            item.value(
-                                "text",
-                                std::string{}));
+                            agent_text);
 
                     } else if (type == "plan") {
                         append_rendered_block(
@@ -3167,15 +3467,18 @@ headerbar.threaddeck-header {
                                 "summary",
                                 nlohmann::json::array()));
 
-                        append_reasoning(
-                            item.value(
-                                "content",
-                                nlohmann::json::array()));
-
                         append_rendered_block(
                             rendered,
                             "Codex reasoning",
                             reasoning);
+
+                    } else if (is_activity_type(type)) {
+                        append_rendered_block(
+                            rendered,
+                            "Codex activity",
+                            render_activity(
+                                item,
+                                turn_status));
 
                     } else if (type == "hookPrompt") {
                         std::string fragments;
@@ -3224,6 +3527,42 @@ headerbar.threaddeck-header {
                             ) +
                             "]");
                     }
+                }
+
+                if (
+                    turn_status == "completed" &&
+                    !rendered_agent_message
+                ) {
+                    append_rendered_block(
+                        rendered,
+                        "Codex",
+                        "(Turn completed without text.)");
+
+                } else if (turn_status == "failed") {
+                    std::string error_message;
+
+                    if (
+                        turn.contains("error") &&
+                        turn["error"].is_object()
+                    ) {
+                        error_message =
+                            turn["error"].value(
+                                "message",
+                                std::string{});
+                    }
+
+                    append_rendered_block(
+                        rendered,
+                        "Codex error",
+                        error_message.empty()
+                            ? "The turn failed without an error message."
+                            : error_message);
+
+                } else if (turn_status == "interrupted") {
+                    append_rendered_block(
+                        rendered,
+                        "Codex",
+                        "Turn interrupted.");
                 }
             }
         }
@@ -3424,6 +3763,268 @@ headerbar.threaddeck-header {
         transcript_.scroll_to(end);
     }
 
+    static std::string live_activity_label(
+        const nlohmann::json& item
+    ) {
+        return activity_label(
+            item.value(
+                "type",
+                std::string{}));
+    }
+
+    static bool is_live_activity(
+        const nlohmann::json& item
+    ) {
+        const std::string type =
+            item.value("type", std::string{});
+
+        return
+            type != "agentMessage" &&
+            type != "reasoning" &&
+            type != "plan";
+    }
+
+    void render_live_turn() {
+        std::string rendered =
+            live_base_transcript_;
+
+        append_rendered_block(
+            rendered,
+            "Codex reasoning",
+            live_reasoning_summary_);
+
+        if (!live_activities_.empty()) {
+            std::string activities;
+
+            for (
+                const LiveActivity& activity :
+                live_activities_
+            ) {
+                if (!activities.empty()) {
+                    activities += '\n';
+                }
+
+                activities += "[";
+                activities += activity.state;
+                activities += "] ";
+                activities += activity.label;
+            }
+
+            append_rendered_block(
+                rendered,
+                "Codex activity",
+                activities);
+        }
+
+        append_rendered_block(
+            rendered,
+            "Codex",
+            live_agent_text_);
+
+        const auto buffer =
+            transcript_.get_buffer();
+
+        buffer->set_text(rendered);
+
+        auto end = buffer->end();
+        transcript_.scroll_to(end);
+    }
+
+    void begin_live_turn() {
+        {
+            std::lock_guard<std::mutex> lock(
+                turn_event_mutex_);
+            pending_turn_events_.clear();
+        }
+
+        active_turn_id_.clear();
+        stop_requested_ = false;
+        live_reasoning_summary_.clear();
+        live_agent_text_.clear();
+        live_activities_.clear();
+
+        live_base_transcript_ =
+            transcript_.get_buffer()
+                ->get_text()
+                .raw();
+    }
+
+    void finalize_live_activities(
+        const std::string& state
+    ) {
+        bool changed = false;
+
+        for (LiveActivity& activity : live_activities_) {
+            if (activity.state == "running") {
+                activity.state = state;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            render_live_turn();
+        }
+    }
+
+    void handle_turn_events() {
+        std::deque<AppServerClient::TurnEvent> events;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                turn_event_mutex_);
+            events.swap(pending_turn_events_);
+        }
+
+        bool transcript_changed = false;
+
+        for (
+            const AppServerClient::TurnEvent& event :
+            events
+        ) {
+            if (
+                !event.thread_id.empty() &&
+                event.thread_id != current_thread_id_
+            ) {
+                continue;
+            }
+
+            switch (event.type) {
+            case AppServerClient::TurnEvent::Type::
+                TurnStarted:
+                active_turn_id_ = event.turn_id;
+                send_button_.set_tooltip_text(
+                    "Stop Codex turn");
+                update_send_button_state();
+                break;
+
+            case AppServerClient::TurnEvent::Type::
+                AgentMessageDelta:
+                live_agent_text_ += event.delta;
+                transcript_changed = true;
+                break;
+
+            case AppServerClient::TurnEvent::Type::
+                ReasoningSummaryDelta:
+                live_reasoning_summary_ += event.delta;
+                transcript_changed = true;
+                break;
+
+            case AppServerClient::TurnEvent::Type::
+                ReasoningTextDelta:
+                break;
+
+            case AppServerClient::TurnEvent::Type::
+                ItemStarted:
+            case AppServerClient::TurnEvent::Type::
+                ItemCompleted: {
+                if (!is_live_activity(event.item)) {
+                    break;
+                }
+
+                const std::string label =
+                    live_activity_label(event.item);
+
+                const auto found =
+                    std::find_if(
+                        live_activities_.begin(),
+                        live_activities_.end(),
+                        [&event, &label](
+                            const LiveActivity& activity
+                        ) {
+                            if (!event.item_id.empty()) {
+                                return
+                                    activity.item_id ==
+                                    event.item_id;
+                            }
+
+                            return
+                                activity.item_id.empty() &&
+                                activity.label == label &&
+                                activity.state == "running";
+                        });
+
+                const std::string state =
+                    event.type ==
+                        AppServerClient::TurnEvent::Type::
+                            ItemStarted
+                        ? "running"
+                        : activity_state(
+                            event.item,
+                            {},
+                            "completed");
+
+                if (found == live_activities_.end()) {
+                    live_activities_.push_back(
+                        {
+                            event.item_id,
+                            label,
+                            state,
+                        });
+                } else {
+                    found->label = label;
+                    found->state = state;
+                }
+
+                transcript_changed = true;
+                break;
+            }
+            }
+        }
+
+        if (transcript_changed) {
+            render_live_turn();
+        }
+    }
+
+    void request_turn_stop() {
+        if (
+            !turn_in_progress_ ||
+            active_turn_id_.empty() ||
+            stop_requested_
+        ) {
+            return;
+        }
+
+        stop_requested_ = true;
+        status_label_.set_text("Codex: stopping");
+        send_button_.set_tooltip_text("Stop requested");
+        update_send_button_state();
+
+        const auto result =
+            app_server_.interrupt_turn(
+                current_thread_id_,
+                active_turn_id_);
+
+        if (!result.success) {
+            stop_requested_ = false;
+            status_label_.set_text(
+                "Codex: stop request failed");
+            send_button_.set_tooltip_text(
+                "Stop Codex turn");
+            update_send_button_state();
+
+            std::cerr
+                << "FAIL: GTK turn/interrupt: "
+                << result.error
+                << '\n';
+            return;
+        }
+
+        std::cout
+            << "PASS: GTK requested interruption for turn "
+            << active_turn_id_
+            << '\n';
+    }
+
+    void handle_send_or_stop() {
+        if (turn_in_progress_) {
+            request_turn_stop();
+            return;
+        }
+
+        submit_prompt();
+    }
+
     void set_turn_busy(bool busy) {
         turn_in_progress_ = busy;
 
@@ -3434,6 +4035,23 @@ headerbar.threaddeck-header {
             !selected_folder_path_.empty());
 
         prompt_.set_editable(!busy);
+
+        send_image_.set_from_icon_name(
+            busy
+                ? "media-playback-stop-symbolic"
+                : "mail-send-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+
+        if (busy) {
+            send_button_.set_tooltip_text(
+                "Waiting for Codex turn to start");
+        } else {
+            active_turn_id_.clear();
+            stop_requested_ = false;
+            send_button_.set_tooltip_text(
+                "Send message (Enter)");
+        }
+
         update_send_button_state();
     }
 
@@ -3557,6 +4175,8 @@ headerbar.threaddeck-header {
             "You:\n" +
             prompt_text);
 
+        begin_live_turn();
+
         status_label_.set_text("Codex: working");
         current_thread_turn_failed_ = false;
         set_turn_busy(true);
@@ -3570,7 +4190,20 @@ headerbar.threaddeck-header {
             [this, thread_id, prompt_text]() {
                 auto result = app_server_.start_turn(
                     thread_id,
-                    prompt_text);
+                    prompt_text,
+                    60000,
+                    [this](
+                        const AppServerClient::TurnEvent& event
+                    ) {
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                turn_event_mutex_);
+                            pending_turn_events_.push_back(
+                                event);
+                        }
+
+                        turn_event_dispatcher_.emit();
+                    });
 
                 {
                     std::lock_guard<std::mutex> lock(
@@ -3599,9 +4232,20 @@ headerbar.threaddeck-header {
                 pending_turn_result_);
         }
 
+        handle_turn_events();
+
+        if (
+            !result.streamed_text.empty() &&
+            live_agent_text_ != result.streamed_text
+        ) {
+            live_agent_text_ = result.streamed_text;
+            render_live_turn();
+        }
+
         set_turn_busy(false);
 
         if (!result.success) {
+            finalize_live_activities("failed");
             status_label_.set_text(
                 "Codex: turn transport failed");
 
@@ -3621,16 +4265,17 @@ headerbar.threaddeck-header {
         }
 
         if (result.status == "completed") {
+            finalize_live_activities("completed");
             status_label_.set_text("Codex: connected");
 
-            append_transcript(
-                "Codex:\n" +
-                (
-                    result.streamed_text.empty()
-                        ? "(Turn completed without text.)"
-                        : result.streamed_text));
+            if (live_agent_text_.empty()) {
+                append_transcript(
+                    "Codex:\n"
+                    "(Turn completed without text.)");
+            }
 
         } else if (result.status == "failed") {
+            finalize_live_activities("failed");
             current_thread_turn_failed_ = true;
 
             status_label_.set_text(
@@ -3644,6 +4289,8 @@ headerbar.threaddeck-header {
                         : result.turn_error));
 
         } else if (result.status == "interrupted") {
+            finalize_live_activities("interrupted");
+
             status_label_.set_text(
                 "Codex: turn interrupted");
 
@@ -3651,6 +4298,8 @@ headerbar.threaddeck-header {
                 "Codex turn interrupted.");
 
         } else {
+            finalize_live_activities("finished");
+
             status_label_.set_text(
                 "Codex: unexpected turn status");
 
@@ -3743,6 +4392,7 @@ headerbar.threaddeck-header {
     Gtk::Image folder_image_;
     Gtk::Image new_thread_image_;
     Gtk::Image context_image_;
+    Gtk::Image send_image_;
 
     Gtk::MenuButton hamburger_button_;
     Gtk::ToggleButton sidebar_toggle_button_;
@@ -3819,10 +4469,30 @@ headerbar.threaddeck-header {
     Glib::RefPtr<Gtk::CssProvider>
         theme_css_provider_;
 
+    struct LiveActivity {
+        std::string item_id;
+        std::string label;
+        std::string state;
+    };
+
     Glib::Dispatcher turn_dispatcher_;
+    Glib::Dispatcher turn_event_dispatcher_;
     std::thread turn_worker_;
+
     std::mutex turn_result_mutex_;
     AppServerClient::TurnResult pending_turn_result_;
+
+    std::mutex turn_event_mutex_;
+    std::deque<AppServerClient::TurnEvent>
+        pending_turn_events_;
+
+    std::string active_turn_id_;
+    bool stop_requested_{false};
+
+    std::string live_base_transcript_;
+    std::string live_reasoning_summary_;
+    std::string live_agent_text_;
+    std::vector<LiveActivity> live_activities_;
 };
 
 int main(int argc, char* argv[]) {

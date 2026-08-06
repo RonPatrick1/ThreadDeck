@@ -112,7 +112,7 @@ AppServerClient::InitializeResult AppServerClient::initialize(
         return result;
     }
 
-    const int request_id = next_request_id_++;
+    const int request_id = allocate_request_id();
 
     const nlohmann::json request = {
         {"id", request_id},
@@ -207,7 +207,7 @@ AppServerClient::RequestResult AppServerClient::request(
         return result;
     }
 
-    const int request_id = next_request_id_++;
+    const int request_id = allocate_request_id();
 
     const nlohmann::json request_message = {
         {"id", request_id},
@@ -305,7 +305,7 @@ AppServerClient::ThreadStartResult AppServerClient::start_thread(
         return result;
     }
 
-    const int request_id = next_request_id_++;
+    const int request_id = allocate_request_id();
 
     const nlohmann::json request = {
         {"id", request_id},
@@ -674,7 +674,8 @@ AppServerClient::ThreadReadResult AppServerClient::read_thread(
 AppServerClient::TurnResult AppServerClient::start_turn(
     const std::string& thread_id,
     const std::string& text,
-    int timeout_ms) {
+    int timeout_ms,
+    const TurnEventCallback& callback) {
     TurnResult result;
 
     if (!is_running()) {
@@ -687,7 +688,7 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         return result;
     }
 
-    const int request_id = next_request_id_++;
+    const int request_id = allocate_request_id();
 
     const nlohmann::json request = {
         {"id", request_id},
@@ -715,6 +716,33 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         std::chrono::milliseconds(timeout_ms);
 
     nlohmann::json pending_completion;
+    bool turn_started_emitted = false;
+
+    const auto emit_event =
+        [&callback](
+            TurnEvent::Type type,
+            const std::string& event_thread_id,
+            const std::string& event_turn_id,
+            const std::string& item_id,
+            const std::string& delta,
+            const nlohmann::json& item,
+            const nlohmann::json& message
+        ) {
+            if (!callback) {
+                return;
+            }
+
+            TurnEvent event;
+            event.type = type;
+            event.thread_id = event_thread_id;
+            event.turn_id = event_turn_id;
+            event.item_id = item_id;
+            event.delta = delta;
+            event.item = item;
+            event.message = message;
+
+            callback(event);
+        };
 
     const auto apply_completion =
         [&result](const nlohmann::json& message) {
@@ -804,6 +832,19 @@ AppServerClient::TurnResult AppServerClient::start_turn(
                 message["result"]["turn"]["id"]
                     .get<std::string>();
 
+            if (!turn_started_emitted) {
+                emit_event(
+                    TurnEvent::Type::TurnStarted,
+                    thread_id,
+                    result.turn_id,
+                    {},
+                    {},
+                    nlohmann::json{},
+                    message);
+
+                turn_started_emitted = true;
+            }
+
             if (
                 !pending_completion.is_null() &&
                 pending_completion.at("params")
@@ -822,6 +863,152 @@ AppServerClient::TurnResult AppServerClient::start_turn(
 
         const std::string method =
             message.value("method", std::string{});
+
+        if (
+            method == "turn/started" &&
+            message.contains("params") &&
+            message["params"].is_object()
+        ) {
+            const auto& params = message["params"];
+
+            if (
+                params.value(
+                    "threadId",
+                    std::string{}) == thread_id &&
+                params.contains("turn") &&
+                params["turn"].is_object()
+            ) {
+                const std::string started_turn_id =
+                    params["turn"].value(
+                        "id",
+                        std::string{});
+
+                if (!started_turn_id.empty()) {
+                    if (result.turn_id.empty()) {
+                        result.turn_id =
+                            started_turn_id;
+                    }
+
+                    if (!turn_started_emitted) {
+                        emit_event(
+                            TurnEvent::Type::TurnStarted,
+                            thread_id,
+                            started_turn_id,
+                            {},
+                            {},
+                            nlohmann::json{},
+                            message);
+
+                        turn_started_emitted = true;
+                    }
+                }
+            }
+
+            continue;
+        }
+
+        if (
+            (
+                method ==
+                    "item/reasoning/summaryTextDelta" ||
+                method ==
+                    "item/reasoning/textDelta"
+            ) &&
+            message.contains("params") &&
+            message["params"].is_object()
+        ) {
+            const auto& params = message["params"];
+
+            const std::string event_turn_id =
+                params.value(
+                    "turnId",
+                    std::string{});
+
+            const bool matching_thread =
+                params.value(
+                    "threadId",
+                    std::string{}) == thread_id;
+
+            const bool matching_turn =
+                result.turn_id.empty() ||
+                event_turn_id == result.turn_id;
+
+            if (
+                matching_thread &&
+                matching_turn &&
+                params.contains("delta") &&
+                params["delta"].is_string()
+            ) {
+                emit_event(
+                    method ==
+                        "item/reasoning/summaryTextDelta"
+                        ? TurnEvent::Type::
+                            ReasoningSummaryDelta
+                        : TurnEvent::Type::
+                            ReasoningTextDelta,
+                    thread_id,
+                    event_turn_id,
+                    params.value(
+                        "itemId",
+                        std::string{}),
+                    params["delta"].get<
+                        std::string>(),
+                    nlohmann::json{},
+                    message);
+            }
+
+            continue;
+        }
+
+        if (
+            (
+                method == "item/started" ||
+                method == "item/completed"
+            ) &&
+            message.contains("params") &&
+            message["params"].is_object()
+        ) {
+            const auto& params = message["params"];
+
+            const std::string event_turn_id =
+                params.value(
+                    "turnId",
+                    std::string{});
+
+            const bool matching_thread =
+                params.value(
+                    "threadId",
+                    std::string{}) == thread_id;
+
+            const bool matching_turn =
+                result.turn_id.empty() ||
+                event_turn_id == result.turn_id;
+
+            if (
+                matching_thread &&
+                matching_turn &&
+                params.contains("item") &&
+                params["item"].is_object()
+            ) {
+                const auto& item =
+                    params["item"];
+
+                emit_event(
+                    method == "item/started"
+                        ? TurnEvent::Type::ItemStarted
+                        : TurnEvent::Type::ItemCompleted,
+                    thread_id,
+                    event_turn_id,
+                    item.value(
+                        "id",
+                        std::string{}),
+                    {},
+                    item,
+                    message);
+            }
+
+            continue;
+        }
 
         if (
             method == "item/agentMessage/delta" &&
@@ -850,8 +1037,21 @@ AppServerClient::TurnResult AppServerClient::start_turn(
                 params.contains("delta") &&
                 params["delta"].is_string()
             ) {
-                result.streamed_text +=
+                const std::string delta =
                     params["delta"].get<std::string>();
+
+                result.streamed_text += delta;
+
+                emit_event(
+                    TurnEvent::Type::AgentMessageDelta,
+                    thread_id,
+                    message_turn_id,
+                    params.value(
+                        "itemId",
+                        std::string{}),
+                    delta,
+                    nlohmann::json{},
+                    message);
             }
 
             continue;
@@ -890,6 +1090,54 @@ AppServerClient::TurnResult AppServerClient::start_turn(
 
     result.error =
         "No terminal turn message was received within the timeout";
+    return result;
+}
+
+AppServerClient::InterruptResult
+AppServerClient::interrupt_turn(
+    const std::string& thread_id,
+    const std::string& turn_id
+) {
+    InterruptResult result;
+
+    if (!is_running()) {
+        result.error =
+            "App Server is not running";
+        return result;
+    }
+
+    if (thread_id.empty()) {
+        result.error =
+            "Thread ID is empty";
+        return result;
+    }
+
+    if (turn_id.empty()) {
+        result.error =
+            "Turn ID is empty";
+        return result;
+    }
+
+    result.request_id =
+        allocate_request_id();
+
+    const nlohmann::json request = {
+        {"id", result.request_id},
+        {"method", "turn/interrupt"},
+        {"params",
+         {
+             {"threadId", thread_id},
+             {"turnId", turn_id},
+         }},
+    };
+
+    if (!write_line(
+            request.dump(),
+            result.error)) {
+        return result;
+    }
+
+    result.success = true;
     return result;
 }
 
@@ -934,9 +1182,19 @@ const std::string& AppServerClient::stderr_output() const {
     return stderr_output_;
 }
 
+int AppServerClient::allocate_request_id() {
+    std::lock_guard<std::mutex> lock(
+        request_id_mutex_);
+
+    return next_request_id_++;
+}
+
 bool AppServerClient::write_line(
     const std::string& line,
     std::string& error) {
+    std::lock_guard<std::mutex> lock(
+        write_mutex_);
+
     const std::string data = line + "\n";
     std::size_t written = 0;
 

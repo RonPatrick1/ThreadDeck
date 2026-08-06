@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <functional>
+#include <mutex>
 #include <vector>
 
 #include <sys/types.h>
@@ -48,6 +50,34 @@ public:
         nlohmann::json thread;
         nlohmann::json response;
         std::vector<nlohmann::json> preceding_messages;
+        std::string error;
+    };
+
+    struct TurnEvent {
+        enum class Type {
+            TurnStarted,
+            AgentMessageDelta,
+            ReasoningSummaryDelta,
+            ReasoningTextDelta,
+            ItemStarted,
+            ItemCompleted,
+        };
+
+        Type type{Type::TurnStarted};
+        std::string thread_id;
+        std::string turn_id;
+        std::string item_id;
+        std::string delta;
+        nlohmann::json item;
+        nlohmann::json message;
+    };
+
+    using TurnEventCallback =
+        std::function<void(const TurnEvent&)>;
+
+    struct InterruptResult {
+        bool success{false};
+        int request_id{0};
         std::string error;
     };
 
@@ -100,7 +130,12 @@ public:
     TurnResult start_turn(
         const std::string& thread_id,
         const std::string& text,
-        int timeout_ms = 60000);
+        int timeout_ms = 60000,
+        const TurnEventCallback& callback = {});
+
+    InterruptResult interrupt_turn(
+        const std::string& thread_id,
+        const std::string& turn_id);
 
     void shutdown();
 
@@ -120,6 +155,7 @@ private:
         const nlohmann::json& params,
         int timeout_ms);
 
+    int allocate_request_id();
     bool write_line(const std::string& line, std::string& error);
     std::string read_line(int timeout_ms, std::string& error);
     void collect_stderr();
@@ -129,5 +165,7 @@ private:
     int stdout_fd_{-1};
     int stderr_fd_{-1};
     int next_request_id_{1};
+    std::mutex request_id_mutex_;
+    std::mutex write_mutex_;
     std::string stderr_output_;
 };
