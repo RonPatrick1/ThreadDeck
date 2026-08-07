@@ -675,7 +675,8 @@ AppServerClient::TurnResult AppServerClient::start_turn(
     const std::string& thread_id,
     const std::string& text,
     int timeout_ms,
-    const TurnEventCallback& callback) {
+    const TurnEventCallback& callback,
+    const ApprovalCallback& approval_callback) {
     TurnResult result;
 
     if (!is_running()) {
@@ -711,7 +712,7 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         return result;
     }
 
-    const auto deadline =
+    auto deadline =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms);
 
@@ -798,6 +799,117 @@ AppServerClient::TurnResult AppServerClient::start_turn(
                 std::string("Invalid JSON message: ") +
                 exception.what();
             return result;
+        }
+
+        const std::string incoming_method =
+            message.value(
+                "method",
+                std::string{});
+
+        const bool is_approval_request =
+            (
+                incoming_method ==
+                    "item/commandExecution/requestApproval" ||
+                incoming_method ==
+                    "item/fileChange/requestApproval"
+            ) &&
+            message.contains("id") &&
+            (
+                message["id"].is_string() ||
+                message["id"].is_number_integer()
+            ) &&
+            message.contains("params") &&
+            message["params"].is_object();
+
+        if (is_approval_request) {
+            result.messages.push_back(message);
+
+            const auto& params =
+                message["params"];
+
+            ApprovalRequest approval_request;
+            approval_request.request_id =
+                message["id"];
+            approval_request.method =
+                incoming_method;
+            approval_request.thread_id =
+                params.value(
+                    "threadId",
+                    std::string{});
+            approval_request.turn_id =
+                params.value(
+                    "turnId",
+                    std::string{});
+            approval_request.item_id =
+                params.value(
+                    "itemId",
+                    std::string{});
+            approval_request.params =
+                params;
+            approval_request.message =
+                message;
+
+            std::string decision{"decline"};
+
+            const bool matching_thread =
+                approval_request.thread_id ==
+                thread_id;
+
+            const bool matching_turn =
+                result.turn_id.empty() ||
+                approval_request.turn_id ==
+                result.turn_id;
+
+            if (
+                matching_thread &&
+                matching_turn &&
+                approval_callback
+            ) {
+                const auto approval_started =
+                    std::chrono::steady_clock::now();
+
+                decision =
+                    approval_callback(
+                        approval_request);
+
+                deadline +=
+                    std::chrono::steady_clock::now() -
+                    approval_started;
+            }
+
+            if (
+                decision != "accept" &&
+                decision != "acceptForSession" &&
+                decision != "decline" &&
+                decision != "cancel"
+            ) {
+                decision = "decline";
+            }
+
+            const nlohmann::json approval_response = {
+                {"id", approval_request.request_id},
+                {"result",
+                 {
+                     {"decision", decision},
+                 }},
+            };
+
+            std::string approval_error;
+
+            if (
+                !write_line(
+                    approval_response.dump(),
+                    approval_error)
+            ) {
+                result.error =
+                    "Could not send " +
+                    incoming_method +
+                    " response: " +
+                    approval_error;
+                return result;
+            }
+
+            continue;
         }
 
         const bool matching_response =

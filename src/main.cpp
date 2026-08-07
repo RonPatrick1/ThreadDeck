@@ -22,6 +22,8 @@
 #include <gtkmm/headerbar.h>
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
+#include <gtkmm/dialog.h>
+#include <gtkmm/expander.h>
 #include <gtkmm/menubutton.h>
 #include <gtkmm/paned.h>
 #include <gtkmm/scrolledwindow.h>
@@ -33,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -220,6 +223,11 @@ public:
             sigc::mem_fun(
                 *this,
                 &MainWindow::handle_turn_events));
+
+        approval_dispatcher_.connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_approval_request));
 
         prompt_.signal_key_press_event().connect(
             sigc::mem_fun(
@@ -514,6 +522,21 @@ public:
     }
 
     ~MainWindow() override {
+        {
+            std::lock_guard<std::mutex> lock(
+                approval_mutex_);
+
+            if (
+                approval_waiting_ &&
+                !approval_resolved_
+            ) {
+                approval_decision_ = "cancel";
+                approval_resolved_ = true;
+            }
+        }
+
+        approval_condition_.notify_all();
+
         if (turn_worker_.joinable()) {
             turn_worker_.join();
         }
@@ -1684,6 +1707,89 @@ headerbar.threaddeck-header {
     opacity: 0.42;
 }
 
+.approval-dialog {
+    background-color: @theme_bg_color;
+}
+
+.approval-shell {
+    padding: 2px;
+}
+
+.approval-eyebrow {
+    font-size: 11px;
+    font-weight: bold;
+    opacity: 0.66;
+}
+
+.approval-title {
+    font-size: 22px;
+    font-weight: bold;
+}
+
+.approval-summary,
+.approval-footnote {
+    opacity: 0.76;
+}
+
+.approval-card {
+    background-color: alpha(@theme_fg_color, 0.055);
+    border: 1px solid alpha(@theme_fg_color, 0.16);
+    border-radius: 12px;
+    padding: 14px 16px;
+}
+
+.approval-card-label,
+.approval-meta-key {
+    font-size: 11px;
+    font-weight: bold;
+    opacity: 0.66;
+}
+
+.approval-code {
+    font-family: monospace;
+}
+
+.approval-meta {
+    padding: 2px 2px;
+}
+
+.approval-details {
+    border-top: 1px solid alpha(@theme_fg_color, 0.12);
+    padding-top: 8px;
+}
+
+#approval-details-view,
+#approval-details-view text {
+    background-color: alpha(@theme_fg_color, 0.045);
+    color: @theme_text_color;
+    border: none;
+    box-shadow: none;
+    font-family: monospace;
+}
+
+button.approval-primary-button {
+    background-image: none;
+    background-color: @theme_selected_bg_color;
+    color: @theme_selected_fg_color;
+    border-radius: 8px;
+    font-weight: bold;
+    padding: 8px 16px;
+}
+
+button.approval-session-button {
+    background-image: none;
+    background-color: alpha(@theme_selected_bg_color, 0.18);
+    border-color: alpha(@theme_selected_bg_color, 0.46);
+    border-radius: 8px;
+    padding: 8px 16px;
+}
+
+button.approval-neutral-button,
+button.approval-danger-button {
+    border-radius: 8px;
+    padding: 8px 14px;
+}
+
 .theme-selector {
     min-width: 128px;
 }
@@ -2137,6 +2243,52 @@ headerbar.threaddeck-header {
             << ".send-button:hover {\n"
             << "    background-color: "
             << palette->accent_color
+            << ";\n"
+            << "}\n\n"
+
+            << "button.approval-primary-button {\n"
+            << "    background-color: "
+            << palette->accent_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->accent_fg_color
+            << ";\n"
+            << "    border-color: "
+            << palette->accent_bg_color
+            << ";\n"
+            << "}\n\n"
+
+            << "button.approval-primary-button:hover {\n"
+            << "    background-color: "
+            << palette->accent_color
+            << ";\n"
+            << "}\n\n"
+
+            << "button.approval-session-button {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.18);\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.52);\n"
+            << "}\n\n"
+
+            << "button.approval-session-button:hover {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.30);\n"
+            << "}\n\n"
+
+            << "#approval-details-view,\n"
+            << "#approval-details-view text {\n"
+            << "    background-color: "
+            << palette->card_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
             << ";\n"
             << "}\n\n"
 
@@ -3866,6 +4018,516 @@ headerbar.threaddeck-header {
         }
     }
 
+    std::string request_approval(
+        const AppServerClient::ApprovalRequest& request
+    ) {
+        {
+            std::lock_guard<std::mutex> lock(
+                approval_mutex_);
+
+            if (approval_waiting_) {
+                return "decline";
+            }
+
+            pending_approval_ = request;
+            approval_decision_.clear();
+            approval_waiting_ = true;
+            approval_resolved_ = false;
+        }
+
+        approval_dispatcher_.emit();
+
+        std::unique_lock<std::mutex> lock(
+            approval_mutex_);
+
+        approval_condition_.wait(
+            lock,
+            [this]() {
+                return approval_resolved_;
+            });
+
+        std::string decision =
+            approval_decision_;
+
+        pending_approval_ =
+            AppServerClient::ApprovalRequest{};
+        approval_decision_.clear();
+        approval_waiting_ = false;
+        approval_resolved_ = false;
+
+        return decision.empty()
+            ? "decline"
+            : decision;
+    }
+
+    void handle_approval_request() {
+        AppServerClient::ApprovalRequest request;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                approval_mutex_);
+
+            if (
+                !approval_waiting_ ||
+                approval_resolved_
+            ) {
+                return;
+            }
+
+            request = pending_approval_;
+        }
+
+        const auto nullable_string =
+            [&request](
+                const std::string& key
+            ) {
+                if (
+                    !request.params.is_object() ||
+                    !request.params.contains(key) ||
+                    !request.params[key].is_string()
+                ) {
+                    return std::string{};
+                }
+
+                return request.params[key]
+                    .get<std::string>();
+            };
+
+        const auto json_string =
+            [&request](
+                const std::string& key
+            ) {
+                if (
+                    !request.params.is_object() ||
+                    !request.params.contains(key) ||
+                    request.params[key].is_null()
+                ) {
+                    return std::string{};
+                }
+
+                const auto& value =
+                    request.params[key];
+
+                return value.is_string()
+                    ? value.get<std::string>()
+                    : value.dump(2);
+            };
+
+        const bool command_approval =
+            request.method ==
+            "item/commandExecution/requestApproval";
+
+        const std::string reason =
+            nullable_string("reason");
+        const std::string command =
+            nullable_string("command");
+        const std::string cwd =
+            nullable_string("cwd");
+        const std::string grant_root =
+            nullable_string("grantRoot");
+
+        const bool has_network_approval_context =
+            request.params.is_object() &&
+            request.params.contains(
+                "networkApprovalContext") &&
+            !request.params[
+                "networkApprovalContext"].is_null();
+
+        const bool session_approval_available =
+            !command_approval ||
+            has_network_approval_context;
+
+        std::string permission_details;
+
+        const auto append_permission_detail =
+            [&permission_details](
+                const std::string& label,
+                const std::string& value
+            ) {
+                if (value.empty()) {
+                    return;
+                }
+
+                if (!permission_details.empty()) {
+                    permission_details += "\n\n";
+                }
+
+                permission_details += label;
+                permission_details += ":\n";
+                permission_details += value;
+            };
+
+        if (command_approval) {
+            append_permission_detail(
+                "Environment",
+                json_string("environmentId"));
+            append_permission_detail(
+                "Additional permissions",
+                json_string("additionalPermissions"));
+            append_permission_detail(
+                "Network approval context",
+                json_string("networkApprovalContext"));
+            append_permission_detail(
+                "Proposed command policy amendment",
+                json_string("proposedExecpolicyAmendment"));
+            append_permission_detail(
+                "Proposed network policy amendments",
+                json_string("proposedNetworkPolicyAmendments"));
+        }
+
+        status_label_.set_text(
+            "Codex: approval required");
+
+        Gtk::Dialog dialog;
+
+        dialog.set_title("Codex approval");
+        dialog.set_transient_for(*this);
+        dialog.set_modal(true);
+        dialog.set_resizable(true);
+        dialog.set_default_size(
+            700,
+            permission_details.empty()
+                ? 430
+                : 560);
+
+        dialog.get_style_context()->add_class(
+            "approval-dialog");
+
+        auto* content_area =
+            dialog.get_content_area();
+
+        Gtk::Box shell(
+            Gtk::ORIENTATION_VERTICAL,
+            18);
+
+        shell.set_border_width(24);
+        shell.get_style_context()->add_class(
+            "approval-shell");
+
+        content_area->pack_start(
+            shell,
+            Gtk::PACK_EXPAND_WIDGET);
+
+        Gtk::Label eyebrow("CODEX APPROVAL");
+        eyebrow.set_xalign(0.0F);
+        eyebrow.get_style_context()->add_class(
+            "approval-eyebrow");
+        shell.pack_start(
+            eyebrow,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Label title(
+            command_approval
+                ? "Run this command?"
+                : "Allow these file changes?");
+
+        title.set_xalign(0.0F);
+        title.get_style_context()->add_class(
+            "approval-title");
+        shell.pack_start(
+            title,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Label summary(
+            command_approval
+                ? "Codex needs your approval before it can "
+                    "run this command."
+                : "Codex needs your approval before it can "
+                    "write these changes.");
+
+        summary.set_xalign(0.0F);
+        summary.set_line_wrap(true);
+        summary.get_style_context()->add_class(
+            "approval-summary");
+        shell.pack_start(
+            summary,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Box action_card(
+            Gtk::ORIENTATION_VERTICAL,
+            6);
+
+        action_card.get_style_context()->add_class(
+            "approval-card");
+
+        Gtk::Label action_label(
+            command_approval
+                ? "COMMAND"
+                : "WRITE ACCESS");
+
+        action_label.set_xalign(0.0F);
+        action_label.get_style_context()->add_class(
+            "approval-card-label");
+        action_card.pack_start(
+            action_label,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Label action_value(
+            command_approval
+                ? (
+                    command.empty()
+                        ? "Command details unavailable"
+                        : command
+                )
+                : (
+                    grant_root.empty()
+                        ? "Requested files were not specified"
+                        : grant_root
+                ));
+
+        action_value.set_xalign(0.0F);
+        action_value.set_line_wrap(true);
+        action_value.set_selectable(true);
+
+        if (command_approval) {
+            action_value.get_style_context()->add_class(
+                "approval-code");
+        }
+
+        action_card.pack_start(
+            action_value,
+            Gtk::PACK_SHRINK);
+
+        shell.pack_start(
+            action_card,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Box metadata(
+            Gtk::ORIENTATION_VERTICAL,
+            12);
+
+        metadata.get_style_context()->add_class(
+            "approval-meta");
+
+        Gtk::Box reason_box(
+            Gtk::ORIENTATION_VERTICAL,
+            3);
+        Gtk::Label reason_key("REASON");
+        Gtk::Label reason_value(
+            reason.empty()
+                ? "No additional reason was provided."
+                : reason);
+
+        reason_key.set_xalign(0.0F);
+        reason_key.get_style_context()->add_class(
+            "approval-meta-key");
+        reason_value.set_xalign(0.0F);
+        reason_value.set_line_wrap(true);
+        reason_value.set_selectable(true);
+
+        reason_box.pack_start(
+            reason_key,
+            Gtk::PACK_SHRINK);
+        reason_box.pack_start(
+            reason_value,
+            Gtk::PACK_SHRINK);
+        metadata.pack_start(
+            reason_box,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Box location_box(
+            Gtk::ORIENTATION_VERTICAL,
+            3);
+        Gtk::Label location_key(
+            command_approval
+                ? "WORKING DIRECTORY"
+                : "PROJECT");
+        Gtk::Label location_value(
+            command_approval
+                ? (
+                    cwd.empty()
+                        ? "Not specified"
+                        : cwd
+                )
+                : (
+                    selected_folder_path_.empty()
+                        ? "Current thread"
+                        : selected_folder_path_
+                ));
+
+        location_key.set_xalign(0.0F);
+        location_key.get_style_context()->add_class(
+            "approval-meta-key");
+        location_value.set_xalign(0.0F);
+        location_value.set_line_wrap(true);
+        location_value.set_selectable(true);
+
+        location_box.pack_start(
+            location_key,
+            Gtk::PACK_SHRINK);
+        location_box.pack_start(
+            location_value,
+            Gtk::PACK_SHRINK);
+        metadata.pack_start(
+            location_box,
+            Gtk::PACK_SHRINK);
+
+        shell.pack_start(
+            metadata,
+            Gtk::PACK_SHRINK);
+
+        Gtk::Expander details_expander(
+            "Permission details");
+
+        Gtk::ScrolledWindow details_scroll;
+        Gtk::TextView details_view;
+
+        if (!permission_details.empty()) {
+            details_expander.set_expanded(false);
+            details_expander.get_style_context()->add_class(
+                "approval-details");
+
+            details_view.set_name(
+                "approval-details-view");
+            details_view.set_editable(false);
+            details_view.set_cursor_visible(false);
+            details_view.set_wrap_mode(
+                Gtk::WRAP_WORD_CHAR);
+            details_view.set_left_margin(12);
+            details_view.set_right_margin(12);
+            details_view.set_top_margin(10);
+            details_view.set_bottom_margin(10);
+            details_view.get_buffer()->set_text(
+                permission_details);
+
+            details_scroll.set_policy(
+                Gtk::POLICY_AUTOMATIC,
+                Gtk::POLICY_AUTOMATIC);
+            details_scroll.set_shadow_type(
+                Gtk::SHADOW_NONE);
+            details_scroll.set_size_request(
+                -1,
+                170);
+            details_scroll.add(details_view);
+            details_expander.add(details_scroll);
+
+            shell.pack_start(
+                details_expander,
+                Gtk::PACK_EXPAND_WIDGET);
+        }
+
+        Gtk::Label footnote(
+            command_approval
+                ? "Approve only if you recognize the command "
+                    "and the access it requests."
+                : "Approve only if this write access matches "
+                    "the change you asked Codex to make.");
+
+        footnote.set_xalign(0.0F);
+        footnote.set_line_wrap(true);
+        footnote.get_style_context()->add_class(
+            "approval-footnote");
+        shell.pack_start(
+            footnote,
+            Gtk::PACK_SHRINK);
+
+        constexpr int approve_once_response = 1;
+        constexpr int approve_session_response = 2;
+        constexpr int decline_response = 3;
+        constexpr int cancel_response = 4;
+
+        Gtk::Button* cancel_button =
+            dialog.add_button(
+                "Cancel turn",
+                cancel_response);
+        Gtk::Button* decline_button =
+            dialog.add_button(
+                "Decline",
+                decline_response);
+        Gtk::Button* session_button = nullptr;
+
+        if (session_approval_available) {
+            session_button =
+                dialog.add_button(
+                    "Approve for session",
+                    approve_session_response);
+        }
+
+        Gtk::Button* approve_button =
+            dialog.add_button(
+                "Approve once",
+                approve_once_response);
+
+        if (cancel_button != nullptr) {
+            cancel_button->get_style_context()->add_class(
+                "approval-danger-button");
+            cancel_button->get_style_context()->add_class(
+                "destructive-action");
+        }
+
+        if (decline_button != nullptr) {
+            decline_button->get_style_context()->add_class(
+                "approval-neutral-button");
+        }
+
+        if (session_button != nullptr) {
+            session_button->get_style_context()->add_class(
+                "approval-session-button");
+        }
+
+        if (approve_button != nullptr) {
+            approve_button->get_style_context()->add_class(
+                "approval-primary-button");
+            approve_button->get_style_context()->add_class(
+                "suggested-action");
+        }
+
+        auto* action_area =
+            dialog.get_action_area();
+
+        if (action_area != nullptr) {
+            action_area->set_spacing(8);
+            action_area->set_border_width(16);
+        }
+
+        dialog.set_default_response(
+            session_approval_available
+                ? approve_session_response
+                : approve_once_response);
+
+        dialog.show_all();
+
+        const int response =
+            dialog.run();
+
+        std::string decision{"cancel"};
+
+        if (response == approve_once_response) {
+            decision = "accept";
+        } else if (
+            response == approve_session_response
+        ) {
+            decision = "acceptForSession";
+        } else if (
+            response == decline_response
+        ) {
+            decision = "decline";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                approval_mutex_);
+
+            if (
+                approval_waiting_ &&
+                !approval_resolved_
+            ) {
+                approval_decision_ =
+                    decision;
+                approval_resolved_ = true;
+            }
+        }
+
+        approval_condition_.notify_one();
+
+        if (turn_in_progress_) {
+            status_label_.set_text(
+                decision == "cancel"
+                    ? "Codex: cancelling turn"
+                    : "Codex: working");
+        }
+    }
+
     void handle_turn_events() {
         std::deque<AppServerClient::TurnEvent> events;
 
@@ -4203,6 +4865,11 @@ headerbar.threaddeck-header {
                         }
 
                         turn_event_dispatcher_.emit();
+                    },
+                    [this](
+                        const AppServerClient::ApprovalRequest& request
+                    ) {
+                        return request_approval(request);
                     });
 
                 {
@@ -4477,6 +5144,7 @@ headerbar.threaddeck-header {
 
     Glib::Dispatcher turn_dispatcher_;
     Glib::Dispatcher turn_event_dispatcher_;
+    Glib::Dispatcher approval_dispatcher_;
     std::thread turn_worker_;
 
     std::mutex turn_result_mutex_;
@@ -4485,6 +5153,14 @@ headerbar.threaddeck-header {
     std::mutex turn_event_mutex_;
     std::deque<AppServerClient::TurnEvent>
         pending_turn_events_;
+
+    std::mutex approval_mutex_;
+    std::condition_variable approval_condition_;
+    AppServerClient::ApprovalRequest
+        pending_approval_;
+    std::string approval_decision_;
+    bool approval_waiting_{false};
+    bool approval_resolved_{false};
 
     std::string active_turn_id_;
     bool stop_requested_{false};

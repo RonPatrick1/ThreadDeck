@@ -75,6 +75,20 @@ public:
     using TurnEventCallback =
         std::function<void(const TurnEvent&)>;
 
+    struct ApprovalRequest {
+        nlohmann::json request_id;
+        std::string method;
+        std::string thread_id;
+        std::string turn_id;
+        std::string item_id;
+        nlohmann::json params;
+        nlohmann::json message;
+    };
+
+    using ApprovalCallback =
+        std::function<std::string(
+            const ApprovalRequest&)>;
+
     struct InterruptResult {
         bool success{false};
         int request_id{0};
@@ -131,7 +145,8 @@ public:
         const std::string& thread_id,
         const std::string& text,
         int timeout_ms = 60000,
-        const TurnEventCallback& callback = {});
+        const TurnEventCallback& callback = {},
+        const ApprovalCallback& approval_callback = {});
 
     InterruptResult interrupt_turn(
         const std::string& thread_id,
