@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1b2733"/>
+      <stop offset="55%" stop-color="#223c50"/>
+      <stop offset="100%" stop-color="#2c4a63"/>
+    </linearGradient>
+
+    <linearGradient id="bubbleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4b82b1"/>
+      <stop offset="100%" stop-color="#8ec0ec"/>
+    </linearGradient>
+
+    <linearGradient id="sparkGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fff3d9"/>
+      <stop offset="55%" stop-color="#f5c15a"/>
+      <stop offset="100%" stop-color="#e2882f"/>
+    </linearGradient>
+
+    <radialGradient id="sparkGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f7c765" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#f7c765" stop-opacity="0"/>
+    </radialGradient>
+
+    <clipPath id="squircleClip">
+      <rect x="16" y="16" width="480" height="480" rx="120" ry="120"/>
+    </clipPath>
+
+    <filter id="bubbleShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#0a1520" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+
+  <!-- background squircle -->
+  <rect x="16" y="16" width="480" height="480" rx="120" ry="120" fill="url(#bgGrad)"/>
+
+  <g clip-path="url(#squircleClip)">
+    <!-- glossy highlight -->
+    <ellipse cx="150" cy="90" rx="240" ry="150" fill="#ffffff" opacity="0.07" transform="rotate(-18 150 90)"/>
+    <ellipse cx="420" cy="470" rx="200" ry="120" fill="#0a1420" opacity="0.18" transform="rotate(-12 420 470)"/>
+
+    <!-- faint neural / AI texture -->
+    <g stroke="#bcd8ef" stroke-width="2" opacity="0.14">
+      <line x1="60" y1="430" x2="120" y2="392"/>
+      <line x1="120" y1="392" x2="108" y2="446"/>
+      <line x1="120" y1="392" x2="176" y2="410"/>
+      <line x1="392" y1="96" x2="440" y2="70"/>
+      <line x1="392" y1="96" x2="404" y2="146"/>
+    </g>
+    <g fill="#dcecfa" opacity="0.22">
+      <circle cx="60" cy="430" r="5"/>
+      <circle cx="120" cy="392" r="6"/>
+      <circle cx="108" cy="446" r="4"/>
+      <circle cx="176" cy="410" r="4"/>
+      <circle cx="392" cy="96" r="5"/>
+      <circle cx="440" cy="70" r="4"/>
+      <circle cx="404" cy="146" r="4"/>
+    </g>
+  </g>
+
+  <!-- AI thread bubble -->
+  <g filter="url(#bubbleShadow)">
+    <polygon points="168,352 138,406 200,358" fill="url(#bubbleGrad)"/>
+    <rect x="106" y="150" width="300" height="212" rx="40" fill="url(#bubbleGrad)"/>
+  </g>
+
+  <!-- AI spark, focal mark -->
+  <circle cx="256" cy="230" r="70" fill="url(#sparkGlow)"/>
+  <path
+    d="M256 176C258.3 197.4 263.6 209.5 276.6 218.6C289.6 227.7 302.4 230.1 322 228C300.6 230.3 288.5 235.6 279.4 248.6C270.3 261.6 267.9 274.4 270 294C267.7 272.6 262.4 260.5 249.4 251.4C236.4 242.3 223.6 239.9 204 242C225.4 239.7 237.5 234.4 246.6 221.4C255.7 208.4 258.1 195.6 256 176Z"
+    fill="url(#sparkGrad)"/>
+
+  <!-- continuing thread indicator -->
+  <g fill="#eaf4fc">
+    <circle cx="222" cy="308" r="8" opacity="0.92"/>
+    <circle cx="256" cy="308" r="8" opacity="0.68"/>
+    <circle cx="290" cy="308" r="8" opacity="0.42"/>
+  </g>
+</svg>

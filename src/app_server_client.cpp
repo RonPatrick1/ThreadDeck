@@ -1,9 +1,11 @@
 #include "app_server_client.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <iostream>
 #include <string>
 
 #include <poll.h>
@@ -15,6 +17,13 @@ AppServerClient::~AppServerClient() {
 }
 
 bool AppServerClient::start(std::string& error) {
+    return start(error, ProcessEnvironment{});
+}
+
+bool AppServerClient::start(
+    std::string& error,
+    const ProcessEnvironment& environment
+) {
     if (is_running()) {
         error = "App Server is already running";
         return false;
@@ -73,6 +82,75 @@ bool AppServerClient::start(std::string& error) {
         ::close(child_stderr[0]);
         ::close(child_stderr[1]);
 
+        if (environment.manage_splunk) {
+            const bool environment_ready =
+                (
+                    environment.splunk_host.empty()
+                        ? ::unsetenv("SPLUNK_HOST")
+                        : ::setenv(
+                            "SPLUNK_HOST",
+                            environment.splunk_host.c_str(),
+                            1)
+                ) == 0 &&
+                (
+                    environment.splunk_token.empty()
+                        ? ::unsetenv("SPLUNK_TOKEN")
+                        : ::setenv(
+                            "SPLUNK_TOKEN",
+                            environment.splunk_token.c_str(),
+                            1)
+                ) == 0;
+
+            if (!environment_ready) {
+                const std::string message =
+                    "Could not configure the Codex process environment\n";
+
+                ::write(
+                    STDERR_FILENO,
+                    message.data(),
+                    message.size());
+                _exit(127);
+            }
+        }
+
+        if (environment.shield_enabled) {
+            const char* inherited_path =
+                ::getenv("PATH");
+            const std::string shield_path =
+                environment.shield_sudo_directory +
+                ":" +
+                (
+                    inherited_path == nullptr
+                        ? std::string{"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+                        : inherited_path
+                );
+
+            const bool shield_ready =
+                !environment.shield_sudo_directory.empty() &&
+                !environment.shield_executor_path.empty() &&
+                ::setenv(
+                    "PATH",
+                    shield_path.c_str(),
+                    1) == 0 &&
+                ::setenv(
+                    "THREADDECK_SHIELD_EXECUTOR",
+                    environment.shield_executor_path.c_str(),
+                    1) == 0;
+
+            if (!shield_ready) {
+                const std::string message =
+                    "Could not configure the ThreadDeck Shield environment\n";
+
+                ::write(
+                    STDERR_FILENO,
+                    message.data(),
+                    message.size());
+                _exit(127);
+            }
+        } else {
+            ::unsetenv("THREADDECK_SHIELD_EXECUTOR");
+        }
+
         ::execlp(
             "codex",
             "codex",
@@ -94,6 +172,7 @@ bool AppServerClient::start(std::string& error) {
     stdin_fd_ = child_stdin[1];
     stdout_fd_ = child_stdout[0];
     stderr_fd_ = child_stderr[0];
+    stdout_buffer_.clear();
     stderr_output_.clear();
     next_request_id_ = 1;
 
@@ -209,11 +288,14 @@ AppServerClient::RequestResult AppServerClient::request(
 
     const int request_id = allocate_request_id();
 
-    const nlohmann::json request_message = {
+    nlohmann::json request_message = {
         {"id", request_id},
         {"method", method},
-        {"params", params},
     };
+
+    if (!params.is_null()) {
+        request_message["params"] = params;
+    }
 
     if (!write_line(
             request_message.dump(),
@@ -297,7 +379,8 @@ AppServerClient::RequestResult AppServerClient::request(
 AppServerClient::ThreadStartResult AppServerClient::start_thread(
     const std::string& cwd,
     bool ephemeral,
-    int timeout_ms) {
+    int timeout_ms,
+    const SessionOptions& options) {
     ThreadStartResult result;
 
     if (!is_running()) {
@@ -307,14 +390,35 @@ AppServerClient::ThreadStartResult AppServerClient::start_thread(
 
     const int request_id = allocate_request_id();
 
+    nlohmann::json params = {
+        {"cwd", cwd},
+        {"ephemeral", ephemeral},
+    };
+
+    if (!options.model.empty()) {
+        params["model"] = options.model;
+    }
+
+    if (!options.reasoning_effort.empty()) {
+        params["config"] = {
+            {"model_reasoning_effort",
+             options.reasoning_effort},
+        };
+    }
+
+    if (!options.approval_policy.is_null()) {
+        params["approvalPolicy"] =
+            options.approval_policy;
+    }
+
+    if (!options.sandbox_mode.empty()) {
+        params["sandbox"] = options.sandbox_mode;
+    }
+
     const nlohmann::json request = {
         {"id", request_id},
         {"method", "thread/start"},
-        {"params",
-         {
-             {"cwd", cwd},
-             {"ephemeral", ephemeral},
-         }},
+        {"params", params},
     };
 
     if (!write_line(request.dump(), result.error)) {
@@ -405,6 +509,32 @@ AppServerClient::ThreadStartResult AppServerClient::start_thread(
 
         result.thread_id =
             thread["id"].get<std::string>();
+
+        result.model =
+            response_result.value(
+                "model",
+                std::string{});
+
+        if (
+            response_result.contains(
+                "reasoningEffort") &&
+            response_result["reasoningEffort"].is_string()
+        ) {
+            result.reasoning_effort =
+                response_result["reasoningEffort"]
+                    .get<std::string>();
+        }
+
+        if (response_result.contains("approvalPolicy")) {
+            result.approval_policy =
+                response_result["approvalPolicy"];
+        }
+
+        if (response_result.contains("sandbox")) {
+            result.sandbox_policy =
+                response_result["sandbox"];
+        }
+
         result.success = true;
         return result;
     }
@@ -415,10 +545,344 @@ AppServerClient::ThreadStartResult AppServerClient::start_thread(
 }
 
 
+
+AppServerClient::JsonResult AppServerClient::list_skills(
+    const std::string& cwd,
+    bool force_reload,
+    int timeout_ms) {
+    JsonResult result;
+
+    if (cwd.empty()) {
+        result.error = "Skills cwd is empty";
+        return result;
+    }
+
+    const nlohmann::json params = {
+        {"cwds", nlohmann::json::array({cwd})},
+        {"forceReload", force_reload},
+    };
+
+    auto request_result =
+        request(
+            "skills/list",
+            params,
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+
+    result.preceding_messages =
+        std::move(
+            request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "skills/list response does not contain a result object";
+        return result;
+    }
+
+    result.result =
+        result.response["result"];
+
+    result.success = true;
+    return result;
+}
+
+
+AppServerClient::JsonResult
+AppServerClient::run_thread_shell_command(
+    const std::string& thread_id,
+    const std::string& command,
+    int timeout_ms) {
+    JsonResult result;
+
+    if (thread_id.empty()) {
+        result.error = "Thread ID is empty";
+        return result;
+    }
+
+    if (command.empty()) {
+        result.error = "Shell command is empty";
+        return result;
+    }
+
+    const nlohmann::json params = {
+        {"threadId", thread_id},
+        {"command", command},
+    };
+
+    auto request_result =
+        request(
+            "thread/shellCommand",
+            params,
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+
+    result.preceding_messages =
+        std::move(
+            request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "thread/shellCommand response does not contain a result object";
+        return result;
+    }
+
+    result.result =
+        result.response["result"];
+
+    const auto is_terminal_command_message =
+        [&thread_id](
+            const nlohmann::json& message
+        ) {
+            if (
+                !message.is_object() ||
+                !message.contains("method") ||
+                !message["method"].is_string() ||
+                message["method"].get<std::string>() !=
+                    "item/completed" ||
+                !message.contains("params") ||
+                !message["params"].is_object()
+            ) {
+                return false;
+            }
+
+            const auto& params = message["params"];
+
+            if (
+                params.contains("threadId") &&
+                (
+                    !params["threadId"].is_string() ||
+                    params["threadId"].get<std::string>() !=
+                        thread_id
+                )
+            ) {
+                return false;
+            }
+
+            return
+                params.contains("item") &&
+                params["item"].is_object() &&
+                params["item"].contains("type") &&
+                params["item"]["type"].is_string() &&
+                params["item"]["type"]
+                    .get<std::string>() ==
+                    "commandExecution";
+        };
+
+    bool completed = std::any_of(
+        result.preceding_messages.begin(),
+        result.preceding_messages.end(),
+        is_terminal_command_message);
+
+    auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+    std::size_t malformed_message_count = 0;
+
+    while (!completed) {
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        if (now >= deadline) {
+            result.error =
+                "No terminal shell command message was "
+                "received within the timeout";
+            return result;
+        }
+
+        const int remaining_ms =
+            static_cast<int>(
+                std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                    deadline - now)
+                    .count());
+
+        std::string read_error;
+        const std::string line =
+            read_line(remaining_ms, read_error);
+
+        if (line.empty()) {
+            result.error = read_error.empty()
+                ? "No terminal shell command message was "
+                  "received within the timeout"
+                : read_error;
+            return result;
+        }
+
+        nlohmann::json message;
+
+        try {
+            message = nlohmann::json::parse(line);
+        } catch (const nlohmann::json::exception& exception) {
+            ++malformed_message_count;
+
+            std::cerr
+                << "WARN: skipped malformed Codex App Server "
+                << "message while waiting for shell completion: "
+                << exception.what()
+                << '\n';
+
+            if (malformed_message_count >= 8) {
+                result.error =
+                    "Too many malformed App Server messages "
+                    "while waiting for shell completion";
+                return result;
+            }
+
+            continue;
+        }
+
+        deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout_ms);
+
+        result.preceding_messages.push_back(
+            message);
+        completed =
+            is_terminal_command_message(message);
+    }
+
+    result.success = true;
+    return result;
+}
+
+
+AppServerClient::JsonResult AppServerClient::list_models(
+    int timeout_ms) {
+    JsonResult result;
+
+    const nlohmann::json params = {
+        {"limit", 100},
+        {"includeHidden", false},
+    };
+
+    auto request_result =
+        request("model/list", params, timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "model/list response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+AppServerClient::JsonResult
+AppServerClient::read_account_rate_limits(
+    int timeout_ms) {
+    JsonResult result;
+
+    auto request_result =
+        request(
+            "account/rateLimits/read",
+            nlohmann::json(nullptr),
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "account/rateLimits/read response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+AppServerClient::JsonResult AppServerClient::read_account_usage(
+    int timeout_ms) {
+    JsonResult result;
+
+    auto request_result =
+        request(
+            "account/usage/read",
+            nlohmann::json(nullptr),
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "account/usage/read response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+
 AppServerClient::ThreadListResult AppServerClient::list_threads(
     const std::string& cwd,
     int limit,
-    int timeout_ms) {
+    int timeout_ms,
+    const std::string& search_term,
+    bool use_state_db_only) {
     ThreadListResult result;
 
     if (limit <= 0) {
@@ -432,10 +896,15 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
         {"limit", limit},
         {"sortDirection", "desc"},
         {"sortKey", "recency_at"},
+        {"useStateDbOnly", use_state_db_only},
     };
 
     if (!cwd.empty()) {
         params["cwd"] = cwd;
+    }
+
+    if (!search_term.empty()) {
+        params["searchTerm"] = search_term;
     }
 
     auto request_result =
@@ -505,11 +974,10 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
     return result;
 }
 
-AppServerClient::ThreadResumeResult
-AppServerClient::resume_thread(
+AppServerClient::JsonResult AppServerClient::delete_thread(
     const std::string& thread_id,
     int timeout_ms) {
-    ThreadResumeResult result;
+    JsonResult result;
 
     if (thread_id.empty()) {
         result.error = "Thread ID is empty";
@@ -518,8 +986,128 @@ AppServerClient::resume_thread(
 
     const nlohmann::json params = {
         {"threadId", thread_id},
+    };
+
+    auto request_result =
+        request("thread/delete", params, timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "thread/delete response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+AppServerClient::JsonResult AppServerClient::update_thread_cwd(
+    const std::string& thread_id,
+    const std::string& cwd,
+    int timeout_ms) {
+    JsonResult result;
+
+    if (thread_id.empty()) {
+        result.error = "Thread ID is empty";
+        return result;
+    }
+
+    if (cwd.empty()) {
+        result.error = "Thread working directory is empty";
+        return result;
+    }
+
+    const nlohmann::json params = {
+        {"threadId", thread_id},
+        {"cwd", cwd},
+    };
+
+    auto request_result =
+        request(
+            "thread/settings/update",
+            params,
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "thread/settings/update response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+AppServerClient::ThreadResumeResult
+AppServerClient::resume_thread(
+    const std::string& thread_id,
+    int timeout_ms,
+    const SessionOptions& options) {
+    ThreadResumeResult result;
+
+    if (thread_id.empty()) {
+        result.error = "Thread ID is empty";
+        return result;
+    }
+
+    nlohmann::json params = {
+        {"threadId", thread_id},
         {"excludeTurns", false},
     };
+
+    if (!options.cwd.empty()) {
+        params["cwd"] = options.cwd;
+    }
+
+    if (!options.model.empty()) {
+        params["model"] = options.model;
+    }
+
+    if (!options.reasoning_effort.empty()) {
+        params["config"] = {
+            {"model_reasoning_effort",
+             options.reasoning_effort},
+        };
+    }
+
+    if (!options.approval_policy.is_null()) {
+        params["approvalPolicy"] =
+            options.approval_policy;
+    }
+
+    if (!options.sandbox_mode.empty()) {
+        params["sandbox"] = options.sandbox_mode;
+    }
 
     auto request_result =
         request("thread/resume", params, timeout_ms);
@@ -592,6 +1180,74 @@ AppServerClient::resume_thread(
     result.thread_id = thread_id;
     result.cwd =
         response_result["cwd"].get<std::string>();
+
+    result.model =
+        response_result.value(
+            "model",
+            std::string{});
+
+    if (
+        response_result.contains(
+            "reasoningEffort") &&
+        response_result["reasoningEffort"].is_string()
+    ) {
+        result.reasoning_effort =
+            response_result["reasoningEffort"]
+                .get<std::string>();
+    }
+
+    if (response_result.contains("approvalPolicy")) {
+        result.approval_policy =
+            response_result["approvalPolicy"];
+    }
+
+    if (response_result.contains("sandbox")) {
+        result.sandbox_policy =
+            response_result["sandbox"];
+    }
+
+    for (
+        const auto& message :
+        result.preceding_messages
+    ) {
+        if (
+            !message.is_object() ||
+            message.value(
+                "method",
+                std::string{}) !=
+                "thread/settings/updated" ||
+            !message.contains("params") ||
+            !message["params"].is_object()
+        ) {
+            continue;
+        }
+
+        const auto& update = message["params"];
+
+        if (
+            update.value(
+                "threadId",
+                std::string{}) != thread_id ||
+            !update.contains("threadSettings") ||
+            !update["threadSettings"].is_object()
+        ) {
+            continue;
+        }
+
+        const auto& settings =
+            update["threadSettings"];
+
+        if (
+            settings.contains("collaborationMode") &&
+            settings["collaborationMode"].is_object()
+        ) {
+            result.collaboration_mode =
+                settings["collaborationMode"].value(
+                    "mode",
+                    std::string{});
+        }
+    }
+
     result.thread = thread;
     result.success = true;
     return result;
@@ -676,7 +1332,36 @@ AppServerClient::TurnResult AppServerClient::start_turn(
     const std::string& text,
     int timeout_ms,
     const TurnEventCallback& callback,
-    const ApprovalCallback& approval_callback) {
+    const ApprovalCallback& approval_callback,
+    const SessionOptions& options) {
+    const nlohmann::json input =
+        nlohmann::json::array(
+            {
+                {
+                    {"type", "text"},
+                    {"text", text},
+                    {"text_elements",
+                     nlohmann::json::array()},
+                },
+            });
+
+    return start_turn_with_input(
+        thread_id,
+        input,
+        timeout_ms,
+        callback,
+        approval_callback,
+        options);
+}
+
+AppServerClient::TurnResult
+AppServerClient::start_turn_with_input(
+    const std::string& thread_id,
+    const nlohmann::json& input,
+    int timeout_ms,
+    const TurnEventCallback& callback,
+    const ApprovalCallback& approval_callback,
+    const SessionOptions& options) {
     TurnResult result;
 
     if (!is_running()) {
@@ -689,35 +1374,110 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         return result;
     }
 
+    if (
+        !input.is_array() ||
+        input.empty()
+    ) {
+        result.error =
+            "Turn input must be a non-empty array";
+        return result;
+    }
+
+    nlohmann::json params = {
+        {"threadId", thread_id},
+        {"input", input},
+    };
+
+    if (!options.cwd.empty()) {
+        params["cwd"] = options.cwd;
+    }
+
+    if (!options.model.empty()) {
+        params["model"] = options.model;
+    }
+
+    if (!options.reasoning_effort.empty()) {
+        params["effort"] =
+            options.reasoning_effort;
+    }
+
+    if (!options.approval_policy.is_null()) {
+        params["approvalPolicy"] =
+            options.approval_policy;
+    }
+
+    if (!options.sandbox_policy.is_null()) {
+        params["sandboxPolicy"] =
+            options.sandbox_policy;
+    }
+
+    return run_streaming_turn_operation(
+        thread_id,
+        "turn/start",
+        params,
+        true,
+        timeout_ms,
+        callback,
+        approval_callback);
+}
+
+AppServerClient::TurnResult
+AppServerClient::compact_thread(
+    const std::string& thread_id,
+    int timeout_ms,
+    const TurnEventCallback& callback
+) {
+    if (thread_id.empty()) {
+        TurnResult result;
+        result.error = "Thread ID is empty";
+        return result;
+    }
+
+    return run_streaming_turn_operation(
+        thread_id,
+        "thread/compact/start",
+        {
+            {"threadId", thread_id},
+        },
+        false,
+        timeout_ms,
+        callback,
+        {});
+}
+
+AppServerClient::TurnResult
+AppServerClient::run_streaming_turn_operation(
+    const std::string& thread_id,
+    const std::string& request_method,
+    const nlohmann::json& params,
+    bool response_contains_turn,
+    int timeout_ms,
+    const TurnEventCallback& callback,
+    const ApprovalCallback& approval_callback
+) {
+    TurnResult result;
+
+    if (!is_running()) {
+        result.error = "App Server is not running";
+        return result;
+    }
+
     const int request_id = allocate_request_id();
 
     const nlohmann::json request = {
         {"id", request_id},
-        {"method", "turn/start"},
-        {"params",
-         {
-             {"threadId", thread_id},
-             {"input",
-              nlohmann::json::array(
-                  {
-                      {
-                          {"type", "text"},
-                          {"text", text},
-                      },
-                  })},
-         }},
+        {"method", request_method},
+        {"params", params},
     };
 
     if (!write_line(request.dump(), result.error)) {
         return result;
     }
 
-    auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(timeout_ms);
-
     nlohmann::json pending_completion;
     bool turn_started_emitted = false;
+    bool request_response_received = false;
+    std::size_t malformed_message_count = 0;
 
     const auto emit_event =
         [&callback](
@@ -768,25 +1528,18 @@ AppServerClient::TurnResult AppServerClient::start_turn(
             result.success = !result.status.empty();
         };
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now());
-
-        const int remaining_ms =
-            remaining.count() > 0
-                ? static_cast<int>(remaining.count())
-                : 1;
-
+    while (true) {
         std::string read_error;
         const std::string message_line =
-            read_line(remaining_ms, read_error);
+            read_line(timeout_ms, read_error);
 
         if (message_line.empty()) {
-            result.error =
-                read_error.empty()
-                    ? "No terminal turn message was received within the timeout"
-                    : read_error;
+            if (read_error.empty()) {
+                continue;
+            }
+
+            result.error = read_error;
+            shutdown();
             return result;
         }
 
@@ -795,10 +1548,18 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         try {
             message = nlohmann::json::parse(message_line);
         } catch (const nlohmann::json::exception& exception) {
-            result.error =
-                std::string("Invalid JSON message: ") +
-                exception.what();
-            return result;
+            ++malformed_message_count;
+
+            std::cerr
+                << "WARN: skipped malformed App Server message "
+                << malformed_message_count
+                << " during active turn ("
+                << message_line.size()
+                << " byte(s)): "
+                << exception.what()
+                << '\n';
+
+            continue;
         }
 
         const std::string incoming_method =
@@ -865,16 +1626,9 @@ AppServerClient::TurnResult AppServerClient::start_turn(
                 matching_turn &&
                 approval_callback
             ) {
-                const auto approval_started =
-                    std::chrono::steady_clock::now();
-
                 decision =
                     approval_callback(
                         approval_request);
-
-                deadline +=
-                    std::chrono::steady_clock::now() -
-                    approval_started;
             }
 
             if (
@@ -922,48 +1676,72 @@ AppServerClient::TurnResult AppServerClient::start_turn(
 
             if (message.contains("error")) {
                 result.error =
-                    "turn/start returned an error: " +
+                    request_method +
+                    " returned an error: " +
                     message["error"].dump();
                 return result;
             }
 
             if (
                 !message.contains("result") ||
-                !message["result"].is_object() ||
-                !message["result"].contains("turn") ||
-                !message["result"]["turn"].is_object() ||
-                !message["result"]["turn"].contains("id") ||
-                !message["result"]["turn"]["id"].is_string()
+                !message["result"].is_object()
             ) {
                 result.error =
-                    "turn/start response does not contain a valid turn";
+                    request_method +
+                    " response does not contain a result object";
                 return result;
             }
 
-            result.turn_id =
-                message["result"]["turn"]["id"]
-                    .get<std::string>();
+            request_response_received = true;
 
-            if (!turn_started_emitted) {
-                emit_event(
-                    TurnEvent::Type::TurnStarted,
-                    thread_id,
-                    result.turn_id,
-                    {},
-                    {},
-                    nlohmann::json{},
-                    message);
+            if (response_contains_turn) {
+                if (
+                    !message["result"].contains("turn") ||
+                    !message["result"]["turn"].is_object() ||
+                    !message["result"]["turn"].contains("id") ||
+                    !message["result"]["turn"]["id"].is_string()
+                ) {
+                    result.error =
+                        request_method +
+                        " response does not contain a valid turn";
+                    return result;
+                }
 
-                turn_started_emitted = true;
+                result.turn_id =
+                    message["result"]["turn"]["id"]
+                        .get<std::string>();
+
+                if (!turn_started_emitted) {
+                    emit_event(
+                        TurnEvent::Type::TurnStarted,
+                        thread_id,
+                        result.turn_id,
+                        {},
+                        {},
+                        nlohmann::json{},
+                        message);
+
+                    turn_started_emitted = true;
+                }
             }
 
             if (
                 !pending_completion.is_null() &&
-                pending_completion.at("params")
-                    .at("turn")
-                    .value("id", std::string{}) ==
-                    result.turn_id
+                (
+                    result.turn_id.empty() ||
+                    pending_completion.at("params")
+                        .at("turn")
+                        .value("id", std::string{}) ==
+                        result.turn_id
+                )
             ) {
+                if (result.turn_id.empty()) {
+                    result.turn_id =
+                        pending_completion.at("params")
+                            .at("turn")
+                            .value("id", std::string{});
+                }
+
                 apply_completion(pending_completion);
                 return result;
             }
@@ -971,10 +1749,104 @@ AppServerClient::TurnResult AppServerClient::start_turn(
             continue;
         }
 
+        int response_id = 0;
+        bool is_steer_response = false;
+        std::string steer_turn_id;
+
+        if (
+            message.contains("id") &&
+            message["id"].is_number_integer()
+        ) {
+            response_id =
+                message["id"].get<int>();
+
+            std::lock_guard<std::mutex> lock(
+                steer_request_mutex_);
+
+            const auto pending =
+                pending_steer_requests_.find(
+                    response_id);
+
+            if (
+                pending !=
+                pending_steer_requests_.end()
+            ) {
+                is_steer_response = true;
+                steer_turn_id = pending->second;
+                pending_steer_requests_.erase(
+                    pending);
+            }
+        }
+
+        if (is_steer_response) {
+            const bool accepted =
+                !message.contains("error") &&
+                message.contains("result") &&
+                message["result"].is_object() &&
+                message["result"].value(
+                    "turnId",
+                    std::string{}) ==
+                    steer_turn_id;
+
+            emit_event(
+                accepted
+                    ? TurnEvent::Type::SteerAccepted
+                    : TurnEvent::Type::SteerRejected,
+                thread_id,
+                steer_turn_id,
+                {},
+                {},
+                nlohmann::json{},
+                message);
+            continue;
+        }
+
         result.messages.push_back(message);
 
         const std::string method =
             message.value("method", std::string{});
+
+        if (
+            (
+                method == "thread/tokenUsage/updated" ||
+                method == "thread/settings/updated"
+            ) &&
+            message.contains("params") &&
+            message["params"].is_object() &&
+            message["params"].value(
+                "threadId",
+                std::string{}) == thread_id
+        ) {
+            emit_event(
+                method == "thread/tokenUsage/updated"
+                    ? TurnEvent::Type::TokenUsageUpdated
+                    : TurnEvent::Type::ThreadSettingsUpdated,
+                thread_id,
+                message["params"].value(
+                    "turnId",
+                    std::string{}),
+                {},
+                {},
+                nlohmann::json{},
+                message);
+            continue;
+        }
+
+        if (
+            method == "account/rateLimits/updated" &&
+            message.contains("params") &&
+            message["params"].is_object()
+        ) {
+            emit_event(
+                TurnEvent::Type::AccountRateLimitsUpdated,
+                thread_id,
+                result.turn_id,
+                {},
+                {},
+                nlohmann::json{},
+                message);
+            continue;
+        }
 
         if (
             method == "turn/started" &&
@@ -1065,6 +1937,55 @@ AppServerClient::TurnResult AppServerClient::start_turn(
                         std::string{}),
                     params["delta"].get<
                         std::string>(),
+                    nlohmann::json{},
+                    message);
+            }
+
+            continue;
+        }
+
+        if (
+            (
+                method == "item/plan/delta" ||
+                method ==
+                    "item/commandExecution/outputDelta"
+            ) &&
+            message.contains("params") &&
+            message["params"].is_object()
+        ) {
+            const auto& params = message["params"];
+
+            const std::string event_turn_id =
+                params.value(
+                    "turnId",
+                    std::string{});
+
+            const bool matching_thread =
+                params.value(
+                    "threadId",
+                    std::string{}) == thread_id;
+
+            const bool matching_turn =
+                result.turn_id.empty() ||
+                event_turn_id == result.turn_id;
+
+            if (
+                matching_thread &&
+                matching_turn &&
+                params.contains("delta") &&
+                params["delta"].is_string()
+            ) {
+                emit_event(
+                    method == "item/plan/delta"
+                        ? TurnEvent::Type::PlanDelta
+                        : TurnEvent::Type::
+                            CommandExecutionOutputDelta,
+                    thread_id,
+                    event_turn_id,
+                    params.value(
+                        "itemId",
+                        std::string{}),
+                    params["delta"].get<std::string>(),
                     nlohmann::json{},
                     message);
             }
@@ -1189,6 +2110,10 @@ AppServerClient::TurnResult AppServerClient::start_turn(
             }
 
             if (result.turn_id.empty()) {
+                result.turn_id = completed_turn_id;
+            }
+
+            if (!request_response_received) {
                 pending_completion = message;
                 continue;
             }
@@ -1200,9 +2125,6 @@ AppServerClient::TurnResult AppServerClient::start_turn(
         }
     }
 
-    result.error =
-        "No terminal turn message was received within the timeout";
-    return result;
 }
 
 AppServerClient::InterruptResult
@@ -1253,6 +2175,68 @@ AppServerClient::interrupt_turn(
     return result;
 }
 
+AppServerClient::SteerResult
+AppServerClient::steer_turn(
+    const std::string& thread_id,
+    const std::string& expected_turn_id,
+    const nlohmann::json& input
+) {
+    SteerResult result;
+
+    if (!is_running()) {
+        result.error =
+            "App Server is not running";
+        return result;
+    }
+
+    if (thread_id.empty()) {
+        result.error = "Thread ID is empty";
+        return result;
+    }
+
+    if (expected_turn_id.empty()) {
+        result.error = "Expected turn ID is empty";
+        return result;
+    }
+
+    if (!input.is_array() || input.empty()) {
+        result.error =
+            "Turn steering input must be a non-empty array";
+        return result;
+    }
+
+    result.request_id = allocate_request_id();
+
+    const nlohmann::json request = {
+        {"id", result.request_id},
+        {"method", "turn/steer"},
+        {"params",
+         {
+             {"threadId", thread_id},
+             {"expectedTurnId", expected_turn_id},
+             {"input", input},
+         }},
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(
+            steer_request_mutex_);
+        pending_steer_requests_[result.request_id] =
+            expected_turn_id;
+    }
+
+    if (!write_line(request.dump(), result.error)) {
+        std::lock_guard<std::mutex> lock(
+            steer_request_mutex_);
+        pending_steer_requests_.erase(
+            result.request_id);
+        return result;
+    }
+
+    result.success = true;
+    return result;
+}
+
 void AppServerClient::shutdown() {
     if (stdin_fd_ >= 0) {
         ::close(stdin_fd_);
@@ -1283,6 +2267,14 @@ void AppServerClient::shutdown() {
     if (stderr_fd_ >= 0) {
         ::close(stderr_fd_);
         stderr_fd_ = -1;
+    }
+
+    stdout_buffer_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(
+            steer_request_mutex_);
+        pending_steer_requests_.clear();
     }
 }
 
@@ -1340,7 +2332,37 @@ std::string AppServerClient::read_line(
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms);
 
+    const auto take_buffered_line =
+        [this](std::string& line) {
+            while (true) {
+                const std::size_t newline =
+                    stdout_buffer_.find('\n');
+
+                if (newline == std::string::npos) {
+                    return false;
+                }
+
+                line = stdout_buffer_.substr(0, newline);
+                stdout_buffer_.erase(0, newline + 1);
+
+                if (
+                    !line.empty() &&
+                    line.back() == '\r'
+                ) {
+                    line.pop_back();
+                }
+
+                if (!line.empty()) {
+                    return true;
+                }
+            }
+        };
+
     std::string line;
+
+    if (take_buffered_line(line)) {
+        return line;
+    }
 
     while (std::chrono::steady_clock::now() < deadline) {
         const auto remaining =
@@ -1376,21 +2398,30 @@ std::string AppServerClient::read_line(
             continue;
         }
 
-        char character = '\0';
+        char buffer[4096];
         const ssize_t read_result =
-            ::read(stdout_fd_, &character, 1);
+            ::read(
+                stdout_fd_,
+                buffer,
+                sizeof(buffer));
 
-        if (read_result == 1) {
-            if (character == '\n') {
+        if (read_result > 0) {
+            stdout_buffer_.append(
+                buffer,
+                static_cast<std::size_t>(
+                    read_result));
+
+            if (take_buffered_line(line)) {
                 return line;
             }
 
-            line.push_back(character);
             continue;
         }
 
         if (read_result == 0) {
-            error = "App Server closed stdout";
+            error = stdout_buffer_.empty()
+                ? "App Server closed stdout"
+                : "App Server closed stdout with an incomplete message";
             return {};
         }
 

@@ -13,6 +13,9 @@ public:
         const std::string& display_label,
         const std::string& working_directory);
 
+    void attach_status_widgets(
+        Gtk::Label& label);
+
     void clear();
 
 private:
@@ -20,6 +23,7 @@ private:
         const std::string& working_directory) const;
 
     Gtk::Box row_{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Box status_box_{Gtk::ORIENTATION_HORIZONTAL};
     Gtk::Label title_;
     Gtk::Label folder_chip_;
 };

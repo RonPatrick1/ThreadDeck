@@ -50,13 +50,55 @@ target_compile_options(codex-app-server-client
 add_executable(threaddeck
     src/main.cpp
     src/context_panel.cpp
+    src/secret_store.cpp
     src/thread_header.cpp
+)
+
+add_executable(threaddeck-shield-control
+    src/shield_control.cpp
+)
+
+target_compile_options(threaddeck-shield-control
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
+add_executable(threaddeck-shield-exec
+    src/shield_exec.cpp
+)
+
+target_compile_options(threaddeck-shield-exec
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
+add_executable(threaddeck-shield-sudo
+    src/shield_sudo.cpp
+)
+
+set_target_properties(threaddeck-shield-sudo
+    PROPERTIES
+        OUTPUT_NAME sudo
+        RUNTIME_OUTPUT_DIRECTORY
+            ${CMAKE_BINARY_DIR}/shield-bin
+)
+
+target_compile_options(threaddeck-shield-sudo
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
 )
 
 target_link_libraries(threaddeck
     PRIVATE
         PkgConfig::GTKMM
         codex-app-server-client
+        ${CMAKE_DL_LIBS}
         Threads::Threads
 )
 
