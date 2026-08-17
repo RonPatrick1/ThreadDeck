@@ -1,0 +1,16 @@
+[Unit]
+Description=ThreadDeck tablet wireless ADB keepalive
+After=threaddeck-tablet-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/CodexNativeUbuntu
+Environment=THREADDECK_TABLET_SERIAL=192.168.0.26:40409
+Environment=THREADDECK_TABLET_MDNS_PREFIX=adb-R5GL351F5QL-
+Environment=THREADDECK_TABLET_PORT=4545
+ExecStart=/var/www/CodexNativeUbuntu/scripts/threaddeck-tablet-adb-keepalive.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

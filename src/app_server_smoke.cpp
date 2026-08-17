@@ -1,6 +1,7 @@
 #include "app_server_client.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -60,11 +61,18 @@ int main() {
         << all_threads.threads.size()
         << " materialized thread(s)\n";
 
+    const char* requested_thread =
+        std::getenv("THREADDECK_SMOKE_THREAD_ID");
+    const std::string requested_thread_id =
+        requested_thread == nullptr
+            ? std::string{}
+            : requested_thread;
+
     const auto selected =
         std::find_if(
             all_threads.threads.begin(),
             all_threads.threads.end(),
-            [](const nlohmann::json& thread) {
+            [&requested_thread_id](const nlohmann::json& thread) {
                 return (
                     thread.is_object() &&
                     thread.value("ephemeral", true) == false &&
@@ -73,7 +81,12 @@ int main() {
                     !thread["id"].get<std::string>().empty() &&
                     thread.contains("cwd") &&
                     thread["cwd"].is_string() &&
-                    !thread["cwd"].get<std::string>().empty()
+                    !thread["cwd"].get<std::string>().empty() &&
+                    (
+                        requested_thread_id.empty() ||
+                        thread["id"].get<std::string>() ==
+                            requested_thread_id
+                    )
                 );
             });
 

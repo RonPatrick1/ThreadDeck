@@ -1,0 +1,13 @@
+[Unit]
+Description=ThreadDeck tablet loopback bridge
+After=threaddeck-tablet-host.service
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/CodexNativeUbuntu
+ExecStart=/var/www/CodexNativeUbuntu/build/threaddeck-tablet-bridge --socket %t/threaddeck/app-server.sock --port 4545
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

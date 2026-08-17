@@ -6,12 +6,16 @@
 #include <nlohmann/json.hpp>
 
 #include <glib.h>
+#include <giomm/appinfo.h>
 #include <giomm/menu.h>
 #include <giomm/simpleaction.h>
 #include <gdk/gdkkeysyms.h>
+#include <gdk-pixbuf/gdk-pixbuf-io.h>
+#include <gdkmm/cursor.h>
 #include <gdkmm/pixbuf.h>
 #include <gdkmm/screen.h>
 #include <glibmm/dispatcher.h>
+#include <glibmm/convert.h>
 #include <glibmm/main.h>
 #include <glibmm/miscutils.h>
 #include <gtkmm/aboutdialog.h>
@@ -19,6 +23,7 @@
 #include <gtkmm/applicationwindow.h>
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
+#include <gtkmm/checkbutton.h>
 #include <gtkmm/clipboard.h>
 #include <gtkmm/comboboxtext.h>
 #include <gtkmm/cssprovider.h>
@@ -29,6 +34,7 @@
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <gtkmm/dialog.h>
+#include <gtkmm/drawingarea.h>
 #include <gtkmm/expander.h>
 #include <gtkmm/menu.h>
 #include <gtkmm/menubutton.h>
@@ -48,9 +54,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <ctime>
 #include <cstdlib>
 #include <deque>
@@ -76,6 +85,146 @@
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+class DoubleShieldIcon final : public Gtk::DrawingArea {
+public:
+    DoubleShieldIcon() {
+        set_size_request(25, 22);
+        set_halign(Gtk::ALIGN_CENTER);
+        set_valign(Gtk::ALIGN_CENTER);
+    }
+
+protected:
+    bool on_draw(
+        const Cairo::RefPtr<Cairo::Context>& context
+    ) override {
+        const Gtk::Widget* parent = get_parent();
+        const auto style =
+            parent != nullptr
+                ? parent->get_style_context()
+                : get_style_context();
+        const auto state =
+            parent != nullptr
+                ? parent->get_state_flags()
+                : get_state_flags();
+        const Gdk::RGBA color =
+            style->get_color(state);
+        const Gtk::Allocation allocation =
+            get_allocation();
+        const double origin_x =
+            std::max(
+                0.0,
+                (allocation.get_width() - 25.0) / 2.0);
+        const double origin_y =
+            std::max(
+                0.0,
+                (allocation.get_height() - 22.0) / 2.0);
+
+        context->set_line_width(1.8);
+        context->set_line_join(
+            Cairo::LINE_JOIN_ROUND);
+        context->set_line_cap(
+            Cairo::LINE_CAP_ROUND);
+
+        draw_shield(
+            context,
+            origin_x + 1.5,
+            origin_y + 1.0,
+            15.0,
+            18.0,
+            color,
+            0.58);
+        draw_shield(
+            context,
+            origin_x + 8.0,
+            origin_y + 4.0,
+            15.0,
+            17.0,
+            color,
+            1.0);
+
+        return true;
+    }
+
+private:
+    static void draw_shield(
+        const Cairo::RefPtr<Cairo::Context>& context,
+        double x,
+        double y,
+        double width,
+        double height,
+        const Gdk::RGBA& color,
+        double opacity
+    ) {
+        context->set_source_rgba(
+            color.get_red(),
+            color.get_green(),
+            color.get_blue(),
+            color.get_alpha() * opacity);
+        shield_path(
+            context,
+            x + 3.1,
+            y + 4.0,
+            width - 6.2,
+            height - 7.0);
+        context->fill();
+        shield_path(
+            context,
+            x,
+            y,
+            width,
+            height);
+        context->stroke();
+    }
+
+    static void shield_path(
+        const Cairo::RefPtr<Cairo::Context>& context,
+        double x,
+        double y,
+        double width,
+        double height
+    ) {
+        const double center = x + (width / 2.0);
+
+        context->begin_new_path();
+        context->move_to(center, y);
+        context->curve_to(
+            center + (width * 0.15),
+            y + (height * 0.10),
+            x + width - (width * 0.13),
+            y + (height * 0.17),
+            x + width,
+            y + (height * 0.19));
+        context->line_to(
+            x + width - (width * 0.05),
+            y + (height * 0.54));
+        context->curve_to(
+            x + width - (width * 0.07),
+            y + (height * 0.74),
+            center + (width * 0.17),
+            y + height - (height * 0.06),
+            center,
+            y + height);
+        context->curve_to(
+            center - (width * 0.17),
+            y + height - (height * 0.06),
+            x + (width * 0.07),
+            y + (height * 0.74),
+            x + (width * 0.05),
+            y + (height * 0.54));
+        context->line_to(
+            x,
+            y + (height * 0.19));
+        context->curve_to(
+            x + (width * 0.13),
+            y + (height * 0.17),
+            center - (width * 0.15),
+            y + (height * 0.10),
+            center,
+            y);
+        context->close_path();
+    }
+};
 
 class SettingsWindow final : public Gtk::Window {
 public:
@@ -1328,6 +1477,49 @@ public:
         int exit_code{-1};
     };
 
+    struct PromptEditSnapshot {
+        Glib::ustring text;
+        int insert_offset{0};
+        int selection_bound_offset{0};
+        std::vector<std::pair<int, int>>
+            pasted_ranges;
+    };
+
+    struct ComposerDraft {
+        PromptEditSnapshot current;
+        std::vector<PromptEditSnapshot> undo_history;
+        std::vector<PromptEditSnapshot> redo_history;
+        std::vector<std::string> image_paths;
+        std::vector<std::string> audio_paths;
+        std::vector<std::string>
+            temporary_attachment_paths;
+    };
+
+    struct PromptCommandHistoryNavigation {
+        bool active{false};
+        std::size_t index{0};
+        Glib::ustring draft;
+    };
+
+    struct ActivityExpansionPayload {
+        std::string activity_identity;
+        std::string preview;
+        std::string full_text;
+    };
+
+    struct ThreadSearchRequest {
+        std::size_t generation{0};
+        std::string search_term;
+        AppServerClient::ProcessEnvironment environment;
+    };
+
+    struct CompletedThreadSearch {
+        std::size_t generation{0};
+        std::string search_term;
+        std::vector<nlohmann::json> threads;
+        std::string error;
+    };
+
     MainWindow()
         : root_(Gtk::ORIENTATION_VERTICAL),
           body_(Gtk::ORIENTATION_HORIZONTAL),
@@ -1373,6 +1565,31 @@ public:
                 *this,
                 &MainWindow::handle_shield_clicked));
 
+        auto_copy_button_.signal_toggled().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_auto_copy_toggled));
+
+        pause_button_.signal_clicked().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_pause_clicked));
+
+        remote_shield_button_.signal_toggled().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_remote_shield_panel_toggled));
+
+        remote_hosts_add_button_.signal_clicked().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::add_remote_host));
+
+        remote_hosts_close_button_.signal_clicked().connect(
+            [this]() {
+                remote_shield_button_.set_active(false);
+            });
+
         sidebar_toggle_button_.signal_toggled().connect(
             sigc::mem_fun(
                 *this,
@@ -1392,6 +1609,11 @@ public:
             sigc::mem_fun(
                 *this,
                 &MainWindow::handle_send_or_stop));
+
+        continue_button_.signal_clicked().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::continue_current_thread));
 
         attachment_button_.signal_clicked().connect(
             sigc::mem_fun(
@@ -1452,6 +1674,18 @@ public:
                 *this,
                 &MainWindow::handle_approval_request));
 
+        thread_search_dispatcher_.connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_thread_search_finished));
+
+        approval_blink_connection_ =
+            Glib::signal_timeout().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::update_approval_blink),
+                650);
+
         prompt_.signal_key_press_event().connect(
             sigc::mem_fun(
                 *this,
@@ -1475,6 +1709,30 @@ public:
                 &MainWindow::handle_prompt_text_inserted),
             true);
 
+        const std::vector<Gtk::TargetEntry>
+            composer_drop_targets = {
+                Gtk::TargetEntry("text/uri-list"),
+            };
+
+        for (
+            Gtk::Widget* drop_target :
+            {
+                static_cast<Gtk::Widget*>(&prompt_),
+                static_cast<Gtk::Widget*>(&prompt_scroll_),
+                static_cast<Gtk::Widget*>(&composer_),
+                static_cast<Gtk::Widget*>(&composer_area_),
+            }
+        ) {
+            drop_target->drag_dest_set(
+                composer_drop_targets,
+                Gtk::DEST_DEFAULT_ALL,
+                Gdk::ACTION_COPY);
+            drop_target->signal_drag_data_received().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::handle_composer_file_drop));
+        }
+
         sidebar_search_.signal_search_changed().connect(
             sigc::mem_fun(
                 *this,
@@ -1487,6 +1745,7 @@ public:
 
         new_thread_button_.set_sensitive(false);
         send_button_.set_sensitive(false);
+        continue_button_.set_sensitive(false);
 
         send_image_.set_from_icon_name(
             "mail-send-symbolic",
@@ -1497,6 +1756,13 @@ public:
         send_button_.set_size_request(42, 42);
         send_button_.set_valign(Gtk::ALIGN_END);
         send_button_.set_tooltip_text("Send message (Enter)");
+
+        continue_button_.set_label("Continue");
+        continue_button_.set_relief(Gtk::RELIEF_NORMAL);
+        continue_button_.set_size_request(-1, 42);
+        continue_button_.set_valign(Gtk::ALIGN_END);
+        continue_button_.set_tooltip_text(
+            "Continue this thread (F11 or Fn+F11)");
 
         model_label_.set_text("Model");
         effort_label_.set_text("Reasoning");
@@ -1543,9 +1809,9 @@ public:
             "YOLO · Full access");
         access_selector_.set_active_id("configured");
         access_selector_.set_tooltip_text(
-            "Saved per thread. Thread policy uses Codex's configured "
-            "approvals and sandbox; YOLO disables both for the normal Unix "
-            "user (not root).");
+            "Saved per thread. Thread policy allows workspace changes and "
+            "asks when additional permission is needed; YOLO disables both "
+            "restrictions for the normal Unix user (not root).");
 
         model_selector_.signal_changed().connect(
             sigc::mem_fun(
@@ -1600,6 +1866,15 @@ public:
             Gtk::PACK_SHRINK);
         session_controls_.pack_start(
             shield_button_,
+            Gtk::PACK_SHRINK);
+        session_controls_.pack_start(
+            auto_copy_button_,
+            Gtk::PACK_SHRINK);
+        session_controls_.pack_start(
+            pause_button_,
+            Gtk::PACK_SHRINK);
+        session_controls_.pack_start(
+            remote_shield_button_,
             Gtk::PACK_SHRINK);
         session_controls_.pack_end(
             usage_label_,
@@ -1701,6 +1976,50 @@ public:
             "Checking privileged authorization…");
         shield_button_.set_sensitive(false);
 
+        auto_copy_image_.set_from_icon_name(
+            "edit-copy-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        auto_copy_button_.set_image(
+            auto_copy_image_);
+        auto_copy_button_.set_always_show_image(true);
+        auto_copy_button_.set_relief(Gtk::RELIEF_NONE);
+        auto_copy_button_.set_size_request(42, 36);
+        auto_copy_button_.get_style_context()->add_class(
+            "compact-header-button");
+        auto_copy_button_.get_style_context()->add_class(
+            "auto-copy-button");
+        auto_copy_button_.set_tooltip_text(
+            "Automatically copy shell command blocks from this thread");
+        auto_copy_button_.set_sensitive(false);
+
+        pause_image_.set_from_icon_name(
+            "media-playback-pause-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        pause_button_.set_image(
+            pause_image_);
+        pause_button_.set_always_show_image(true);
+        pause_button_.set_relief(Gtk::RELIEF_NONE);
+        pause_button_.set_size_request(42, 36);
+        pause_button_.get_style_context()->add_class(
+            "compact-header-button");
+        pause_button_.get_style_context()->add_class(
+            "thread-pause-button");
+        pause_button_.set_tooltip_text(
+            "Pause this thread at a safe checkpoint");
+        pause_button_.set_sensitive(false);
+
+        remote_shield_button_.add(
+            remote_shield_icon_);
+        remote_shield_icon_.show();
+        remote_shield_button_.set_relief(Gtk::RELIEF_NONE);
+        remote_shield_button_.set_size_request(42, 36);
+        remote_shield_button_.get_style_context()->add_class(
+            "compact-header-button");
+        remote_shield_button_.get_style_context()->add_class(
+            "remote-shield-button");
+        remote_shield_button_.set_tooltip_text(
+            "Show Remote Shield hosts for this thread");
+
         hamburger_button_.set_always_show_image(true);
         sidebar_toggle_button_.set_always_show_image(true);
         folder_button_.set_always_show_image(true);
@@ -1776,8 +2095,10 @@ public:
         sidebar_search_.set_placeholder_text(
             "Search threads");
         sidebar_search_.set_tooltip_text(
-            "Search Codex thread titles across all projects");
+            "Search titles and message text across all projects");
         sidebar_search_.set_hexpand(true);
+        sidebar_search_.set_name(
+            "sidebar-thread-search");
 
         sidebar_sort_image_.set_from_icon_name(
             "view-sort-descending-symbolic",
@@ -1858,6 +2179,8 @@ public:
         sidebar_scroll_.set_policy(
             Gtk::POLICY_NEVER,
             Gtk::POLICY_AUTOMATIC);
+        sidebar_scroll_.set_name(
+            "sidebar-thread-scroll");
         sidebar_scroll_.set_overlay_scrolling(false);
         sidebar_scroll_.set_shadow_type(Gtk::SHADOW_NONE);
         sidebar_scroll_.add(sidebar_list_);
@@ -1871,6 +2194,23 @@ public:
 
         transcript_.set_editable(false);
         transcript_.set_wrap_mode(Gtk::WRAP_WORD_CHAR);
+        transcript_.add_events(
+            Gdk::POINTER_MOTION_MASK |
+            Gdk::LEAVE_NOTIFY_MASK);
+        transcript_.signal_realize().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_transcript_realized));
+        transcript_.signal_motion_notify_event().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_transcript_pointer_motion),
+            false);
+        transcript_.signal_leave_notify_event().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_transcript_pointer_leave),
+            false);
         transcript_scroll_.add(transcript_);
 
         transcript_bottom_image_.set_from_icon_name(
@@ -2010,6 +2350,9 @@ public:
         composer_.pack_end(
             send_button_,
             Gtk::PACK_SHRINK);
+        composer_.pack_end(
+            continue_button_,
+            Gtk::PACK_SHRINK);
 
         composer_area_.set_spacing(4);
         composer_area_.pack_start(
@@ -2027,13 +2370,61 @@ public:
         workspace_.pack2(context_panel_, false, true);
         workspace_.set_position(620);
 
+        remote_hosts_title_.set_markup(
+            "<b>Remote Shield</b>");
+        remote_hosts_title_.set_xalign(0.0F);
+        remote_hosts_title_.set_hexpand(true);
+        remote_hosts_add_button_.set_label("+");
+        remote_hosts_add_button_.set_tooltip_text(
+            "Add a remote computer and sudo credential");
+        remote_hosts_close_button_.set_label("×");
+        remote_hosts_close_button_.set_tooltip_text(
+            "Close Remote Shield hosts");
+        remote_hosts_header_.set_spacing(4);
+        remote_hosts_header_.pack_start(
+            remote_hosts_title_,
+            Gtk::PACK_EXPAND_WIDGET);
+        remote_hosts_header_.pack_start(
+            remote_hosts_add_button_,
+            Gtk::PACK_SHRINK);
+        remote_hosts_header_.pack_start(
+            remote_hosts_close_button_,
+            Gtk::PACK_SHRINK);
+        remote_hosts_list_.set_spacing(6);
+        remote_hosts_scroll_.set_policy(
+            Gtk::POLICY_NEVER,
+            Gtk::POLICY_AUTOMATIC);
+        remote_hosts_scroll_.add(remote_hosts_list_);
+        remote_hosts_panel_.set_spacing(8);
+        remote_hosts_panel_.set_border_width(10);
+        remote_hosts_panel_.set_size_request(290, -1);
+        remote_hosts_panel_.get_style_context()->add_class(
+            "remote-hosts-panel");
+        remote_hosts_panel_.pack_start(
+            remote_hosts_header_,
+            Gtk::PACK_SHRINK);
+        remote_hosts_panel_.pack_start(
+            remote_hosts_scroll_,
+            Gtk::PACK_EXPAND_WIDGET);
+        remote_hosts_panel_.set_no_show_all(true);
+
+        main_workspace_.pack1(
+            workspace_,
+            true,
+            true);
+        main_workspace_.pack2(
+            remote_hosts_panel_,
+            false,
+            true);
+
         body_.pack1(sidebar_, false, true);
-        body_.pack2(workspace_, true, false);
+        body_.pack2(main_workspace_, true, false);
         body_.set_position(260);
 
         root_.pack_start(body_, Gtk::PACK_EXPAND_WIDGET);
 
         load_ui_state();
+        load_known_ssh_hosts();
         sidebar_sort_image_.set_from_icon_name(
             sidebar_project_sort_ == "updated-desc" ||
                     sidebar_project_sort_ == "name-desc"
@@ -2042,6 +2433,7 @@ public:
             Gtk::ICON_SIZE_BUTTON);
         load_splunk_token();
         initialize_text_tags();
+        reset_prompt_edit_history();
 
         theme_selector_.set_active_id(
             theme_id_);
@@ -2085,6 +2477,7 @@ public:
         update_prompt_height();
         initialize_app_server();
         show_all_children();
+        apply_remote_hosts_panel_visibility();
         refresh_attachment_row();
         apply_sidebar_visibility(false);
         apply_context_panel_visibility(false);
@@ -2109,44 +2502,72 @@ public:
             sigc::mem_fun(
                 *this,
                 &MainWindow::apply_restored_pane_positions));
+
+        thread_search_worker_ = std::thread(
+            [this]() {
+                run_thread_search_worker();
+            });
     }
 
     ~MainWindow() override {
+        std::vector<
+            std::shared_ptr<PendingApprovalState>
+        > approvals_to_cancel;
+
         {
             std::lock_guard<std::mutex> lock(
                 approval_mutex_);
 
             shutting_down_ = true;
 
-            if (
-                approval_waiting_ &&
-                !approval_resolved_
-            ) {
-                approval_decision_ = "cancel";
-                approval_resolved_ = true;
+            for (const auto& pending : pending_approvals_) {
+                if (
+                    pending != nullptr &&
+                    !pending->resolved
+                ) {
+                    pending->decision = "cancel";
+                    pending->resolved = true;
+                    approvals_to_cancel.push_back(pending);
+                }
             }
         }
 
-        approval_condition_.notify_all();
+        for (const auto& pending : approvals_to_cancel) {
+            pending->condition.notify_all();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                thread_search_mutex_);
+            thread_search_stop_ = true;
+            thread_search_has_request_ = false;
+        }
+
+        thread_search_condition_.notify_all();
+
+        if (thread_search_worker_.joinable()) {
+            thread_search_worker_.join();
+        }
 
         for (auto& entry : turn_sessions_) {
             ThreadTurnSession& session =
                 *entry.second;
 
             if (
-                session.busy &&
                 session.client &&
-                !session.active_turn_id.empty()
+                session.worker.joinable()
             ) {
-                session.client->interrupt_turn(
-                    session.thread_id,
-                    session.active_turn_id);
+                session.client->cancel_pending_operation();
             }
         }
 
         for (auto& entry : turn_sessions_) {
             if (entry.second->worker.joinable()) {
                 entry.second->worker.join();
+            }
+
+            if (entry.second->client) {
+                entry.second->client->shutdown();
             }
 
             if (entry.second->loader.joinable()) {
@@ -2168,8 +2589,13 @@ public:
             thread_move_worker_.join();
         }
 
-        remove_temporary_attachment_files(
-            queued_temporary_attachment_paths_);
+        save_current_composer_draft();
+
+        for (auto& draft : composer_drafts_) {
+            remove_temporary_attachment_files(
+                draft.second
+                    .temporary_attachment_paths);
+        }
     }
 
 private:
@@ -2289,6 +2715,7 @@ private:
     }
 
     void clear_active_thread_surfaces() {
+        switch_composer_to_thread({});
         current_thread_default_label_.clear();
         current_thread_data_ =
             nlohmann::json::object();
@@ -2311,12 +2738,6 @@ private:
         skill_catalog_.clear();
         skill_catalog_cwd_.clear();
         skill_popover_.popdown();
-
-        remove_temporary_attachment_files(
-            queued_temporary_attachment_paths_);
-        attached_image_paths_.clear();
-        attached_audio_paths_.clear();
-        refresh_attachment_row();
 
         thread_header_.clear();
         context_panel_.clear();
@@ -2382,6 +2803,7 @@ private:
         const nlohmann::json& thread_data =
             nlohmann::json::object()
     ) {
+        switch_composer_to_thread(thread_id);
         current_thread_default_label_ =
             default_label;
         current_thread_data_ =
@@ -2392,7 +2814,11 @@ private:
             thread_id;
 
         refresh_active_thread_surfaces_from_labels();
+        seed_prompt_history_from_thread(
+            thread_id,
+            thread_data);
         load_skills_for_cwd(cwd);
+        update_pause_button();
     }
 
     static double json_number(
@@ -2514,6 +2940,38 @@ private:
         return "Limit";
     }
 
+    static void merge_sparse_json_object(
+        nlohmann::json& target,
+        const nlohmann::json& update
+    ) {
+        if (!update.is_object()) {
+            return;
+        }
+
+        if (!target.is_object()) {
+            target = nlohmann::json::object();
+        }
+
+        for (
+            auto field = update.begin();
+            field != update.end();
+            ++field
+        ) {
+            if (field.value().is_null()) {
+                continue;
+            }
+
+            if (field.value().is_object()) {
+                merge_sparse_json_object(
+                    target[field.key()],
+                    field.value());
+            } else {
+                target[field.key()] =
+                    field.value();
+            }
+        }
+    }
+
     static bool is_yolo_policy(
         const nlohmann::json& approval_policy,
         const nlohmann::json& sandbox_policy
@@ -2571,8 +3029,15 @@ private:
         return nullptr;
     }
 
-    void populate_model_selector() {
+    void populate_model_selector(
+        const std::string& preferred_model = {}
+    ) {
         model_selector_.remove_all();
+
+        const std::string selected_model =
+            preferred_model.empty()
+                ? effective_model_
+                : preferred_model;
 
         bool effective_found = false;
         std::string default_model;
@@ -2627,24 +3092,24 @@ private:
                     id,
                     display);
 
-                if (id == effective_model_) {
+                if (id == selected_model) {
                     effective_found = true;
                 }
             }
         }
 
         if (
-            !effective_model_.empty() &&
+            !selected_model.empty() &&
             !effective_found
         ) {
             model_selector_.append(
-                effective_model_,
-                effective_model_);
+                selected_model,
+                selected_model);
         }
 
-        if (!effective_model_.empty()) {
+        if (!selected_model.empty()) {
             model_selector_.set_active_id(
-                effective_model_);
+                selected_model);
         } else if (!default_model.empty()) {
             model_selector_.set_active_id(
                 default_model);
@@ -2734,8 +3199,7 @@ private:
             (
                 !current_thread_id_.empty() ||
                 !selected_folder_path_.empty()
-            ) &&
-            !turn_in_progress_;
+            );
 
         model_selector_.set_sensitive(
             selectable &&
@@ -2746,8 +3210,7 @@ private:
             effort_selector_.get_active_row_number() >= 0);
 
         access_selector_.set_sensitive(
-            !current_thread_id_.empty() &&
-            !turn_in_progress_);
+            !current_thread_id_.empty());
 
         mode_selector_.set_sensitive(false);
     }
@@ -2755,15 +3218,50 @@ private:
     void refresh_session_controls() {
         session_controls_updating_ = true;
 
-        populate_model_selector();
+        std::string selected_model =
+            effective_model_;
+        const auto saved_model =
+            thread_model_selections_.find(
+                current_thread_id_);
 
-        const std::string selected_model =
+        if (
+            saved_model !=
+                thread_model_selections_.end() &&
+            !saved_model->second.empty()
+        ) {
+            selected_model = saved_model->second;
+        }
+
+        populate_model_selector(selected_model);
+
+        selected_model =
             model_selector_.get_active_id().raw();
+
+        std::string selected_effort =
+            effective_reasoning_effort_;
+        const auto saved_effort =
+            thread_reasoning_selections_.find(
+                current_thread_id_);
+
+        if (
+            saved_effort !=
+                thread_reasoning_selections_.end() &&
+            !saved_effort->second.empty()
+        ) {
+            selected_effort = saved_effort->second;
+        }
 
         populate_reasoning_selector(
             selected_model,
-            effective_reasoning_effort_,
-            effective_model_.empty());
+            selected_effort,
+            selected_effort.empty());
+
+        model_selector_.set_tooltip_text(
+            "Saved for this thread and applied to the next turn. "
+            "A running turn keeps the model it started with.");
+        effort_selector_.set_tooltip_text(
+            "Saved for this thread and applied to the next turn. "
+            "A running turn keeps the reasoning effort it started with.");
 
         mode_selector_.set_active_id(
             effective_mode_.empty()
@@ -2831,6 +3329,9 @@ private:
             access_tooltip);
 
         update_shield_button();
+        update_auto_copy_button();
+        update_pause_button();
+        refresh_remote_hosts_panel();
 
         session_controls_updating_ = false;
 
@@ -2929,20 +3430,34 @@ private:
         options.reasoning_effort =
             effort_selector_.get_active_id().raw();
 
+        options.shield_enabled =
+            shield_enabled_ &&
+            thread_shield_selections_.find(
+                current_thread_id_) !=
+                thread_shield_selections_.end();
+        options.remote_shield_hosts =
+            remote_shield_hosts_for_thread(
+                current_thread_id_);
+
         const std::string access =
             access_selector_.get_active_id().raw();
 
         if (access == "yolo") {
             options.approval_policy =
                 "never";
+            options.sandbox_mode =
+                "danger-full-access";
             options.sandbox_policy = {
                 {"type", "dangerFullAccess"},
             };
         } else {
             options.approval_policy =
-                configured_approval_policy_;
-            options.sandbox_policy =
-                configured_sandbox_policy_;
+                "on-request";
+            options.sandbox_mode =
+                "workspace-write";
+            options.sandbox_policy = {
+                {"type", "workspaceWrite"},
+            };
         }
 
         return options;
@@ -2969,6 +3484,20 @@ private:
 
         session_controls_updating_ = false;
 
+        if (!current_thread_id_.empty()) {
+            thread_model_selections_[
+                current_thread_id_] = model;
+
+            const std::string effort =
+                effort_selector_.get_active_id().raw();
+            if (!effort.empty()) {
+                thread_reasoning_selections_[
+                    current_thread_id_] = effort;
+            }
+
+            save_ui_state();
+        }
+
         status_label_.set_text(
             current_thread_id_.empty()
                 ? "Codex: model will apply to the new thread"
@@ -2985,8 +3514,6 @@ private:
         ) {
             const std::string effort =
                 effort_selector_.get_active_id().raw();
-
-            effective_reasoning_effort_ = effort;
 
             if (!current_thread_id_.empty()) {
                 thread_reasoning_selections_[
@@ -3100,22 +3627,39 @@ private:
             account_rate_limits_["rateLimits"]
                 .is_object()
         ) {
-            const auto& snapshot =
-                account_rate_limits_["rateLimits"];
+            const nlohmann::json* snapshot =
+                &account_rate_limits_["rateLimits"];
+
+            if (
+                account_rate_limits_.contains(
+                    "rateLimitsByLimitId") &&
+                account_rate_limits_[
+                    "rateLimitsByLimitId"].is_object() &&
+                account_rate_limits_[
+                    "rateLimitsByLimitId"].contains(
+                        "codex") &&
+                account_rate_limits_[
+                    "rateLimitsByLimitId"]["codex"]
+                        .is_object()
+            ) {
+                snapshot =
+                    &account_rate_limits_[
+                        "rateLimitsByLimitId"]["codex"];
+            }
 
             for (
                 const char* key :
                 {"primary", "secondary"}
             ) {
                 if (
-                    !snapshot.contains(key) ||
-                    !snapshot[key].is_object()
+                    !snapshot->contains(key) ||
+                    !(*snapshot)[key].is_object()
                 ) {
                     continue;
                 }
 
                 const auto& window =
-                    snapshot[key];
+                    (*snapshot)[key];
 
                 const std::string name =
                     rate_window_name(window);
@@ -3128,11 +3672,27 @@ private:
                                 nlohmann::json(0.0))) +
                         0.5);
 
-                parts.push_back(
+                std::string reset;
+
+                if (
+                    window.contains("resetsAt") &&
+                    !window["resetsAt"].is_null()
+                ) {
+                    reset = format_reset_time(
+                        window["resetsAt"]);
+                }
+
+                std::string label =
                     name +
                     " " +
                     std::to_string(used) +
-                    "%");
+                    "%";
+
+                if (!reset.empty()) {
+                    label += " · resets " + reset;
+                }
+
+                parts.push_back(label);
 
                 tooltip
                     << name
@@ -3140,19 +3700,10 @@ private:
                     << used
                     << "%";
 
-                if (
-                    window.contains("resetsAt") &&
-                    !window["resetsAt"].is_null()
-                ) {
-                    const std::string reset =
-                        format_reset_time(
-                            window["resetsAt"]);
-
-                    if (!reset.empty()) {
-                        tooltip
-                            << " · resets "
-                            << reset;
-                    }
+                if (!reset.empty()) {
+                    tooltip
+                        << " · resets "
+                        << reset;
                 }
 
                 tooltip << '\n';
@@ -3288,6 +3839,7 @@ private:
     bool apply_restored_pane_positions() {
         apply_sidebar_visibility(false);
         apply_context_panel_visibility(false);
+        apply_remote_hosts_panel_visibility();
         pane_position_tracking_ready_ = true;
         return false;
     }
@@ -3522,6 +4074,8 @@ private:
             shield_sudo_directory().string();
         environment.shield_executor_path =
             shield_executor_path().string();
+        environment.remote_shield_ssh_directory =
+            remote_shield_ssh_directory().string();
 
         return environment;
     }
@@ -3563,6 +4117,754 @@ private:
             ? std::filesystem::path{}
             : control.parent_path() /
                 "shield-bin";
+    }
+
+    static std::filesystem::path
+    remote_shield_ssh_directory() {
+        const auto control =
+            shield_control_path();
+
+        return control.empty()
+            ? std::filesystem::path{}
+            : control.parent_path() /
+                "remote-shield-bin";
+    }
+
+    static bool valid_remote_destination(
+        const std::string& destination
+    ) {
+        if (
+            destination.empty() ||
+            destination.front() == '-'
+        ) {
+            return false;
+        }
+
+        return std::all_of(
+            destination.begin(),
+            destination.end(),
+            [](unsigned char character) {
+                return
+                    std::isalnum(character) ||
+                    character == '.' ||
+                    character == '_' ||
+                    character == '-' ||
+                    character == '@' ||
+                    character == ':' ||
+                    character == '[' ||
+                    character == ']' ||
+                    character == '%';
+            });
+    }
+
+    void load_known_ssh_hosts() {
+        const char* home = std::getenv("HOME");
+
+        if (home == nullptr || *home == '\0') {
+            return;
+        }
+
+        std::ifstream input(
+            std::filesystem::path(home) /
+            ".ssh" /
+            "config");
+
+        if (!input) {
+            return;
+        }
+
+        std::string line;
+
+        while (std::getline(input, line)) {
+            const std::size_t comment = line.find('#');
+
+            if (comment != std::string::npos) {
+                line.erase(comment);
+            }
+
+            std::istringstream parser(line);
+            std::string keyword;
+            parser >> keyword;
+
+            std::transform(
+                keyword.begin(),
+                keyword.end(),
+                keyword.begin(),
+                [](unsigned char character) {
+                    return static_cast<char>(
+                        std::tolower(character));
+                });
+
+            if (keyword != "host") {
+                continue;
+            }
+
+            std::string alias;
+
+            while (parser >> alias) {
+                if (
+                    alias.find_first_of("*?!") !=
+                        std::string::npos ||
+                    !valid_remote_destination(alias)
+                ) {
+                    continue;
+                }
+
+                remote_host_labels_.try_emplace(
+                    alias,
+                    alias);
+            }
+        }
+    }
+
+    static bool observed_ssh_option_requires_argument(
+        const std::string& option
+    ) {
+        return
+            option.size() == 2 &&
+            option.front() == '-' &&
+            std::string("BbcDEeFIiJLlmOoPpQRSWw")
+                .find(option[1]) !=
+                std::string::npos;
+    }
+
+    void observe_remote_host_from_command(
+        const std::string& thread_id,
+        const std::string& command
+    ) {
+        std::size_t search = 0;
+
+        while (search < command.size()) {
+            const std::size_t ssh =
+                command.find("ssh", search);
+
+            if (ssh == std::string::npos) {
+                return;
+            }
+
+            const bool left_boundary =
+                ssh == 0 ||
+                std::isspace(
+                    static_cast<unsigned char>(
+                        command[ssh - 1])) ||
+                std::string(";&|('\"")
+                    .find(command[ssh - 1]) !=
+                    std::string::npos;
+            const std::size_t after = ssh + 3;
+            const bool right_boundary =
+                after < command.size() &&
+                std::isspace(
+                    static_cast<unsigned char>(
+                        command[after]));
+
+            if (!left_boundary || !right_boundary) {
+                search = after;
+                continue;
+            }
+
+            std::istringstream parser(
+                command.substr(after));
+            std::vector<std::string> arguments;
+            std::string argument;
+
+            while (parser >> argument) {
+                arguments.push_back(argument);
+            }
+
+            for (
+                std::size_t index = 0;
+                index < arguments.size();
+                ++index
+            ) {
+                argument = arguments[index];
+
+                while (
+                    !argument.empty() &&
+                    std::string("'\"").find(
+                        argument.front()) !=
+                        std::string::npos
+                ) {
+                    argument.erase(argument.begin());
+                }
+
+                while (
+                    !argument.empty() &&
+                    std::string("'\";,|&)").find(
+                        argument.back()) !=
+                        std::string::npos
+                ) {
+                    argument.pop_back();
+                }
+
+                if (argument == "--") {
+                    continue;
+                }
+
+                if (
+                    argument.size() > 1 &&
+                    argument.front() == '-'
+                ) {
+                    if (
+                        observed_ssh_option_requires_argument(
+                            argument) &&
+                        index + 1 < arguments.size()
+                    ) {
+                        ++index;
+                    }
+                    continue;
+                }
+
+                if (!valid_remote_destination(argument)) {
+                    break;
+                }
+
+                const bool new_host =
+                    remote_host_labels_.try_emplace(
+                        argument,
+                        argument).second;
+                const bool new_association =
+                    thread_observed_remote_hosts_[
+                        thread_id].insert(argument).second;
+
+                if (new_host || new_association) {
+                    save_ui_state();
+
+                    if (
+                        thread_id == current_thread_id_ &&
+                        remote_hosts_panel_visible_
+                    ) {
+                        refresh_remote_hosts_panel();
+                    }
+                }
+
+                return;
+            }
+
+            search = after;
+        }
+    }
+
+    std::vector<std::string>
+    remote_shield_hosts_for_thread(
+        const std::string& thread_id
+    ) const {
+        std::vector<std::string> hosts;
+        const auto selected =
+            thread_remote_shield_hosts_.find(thread_id);
+
+        if (selected == thread_remote_shield_hosts_.end()) {
+            return hosts;
+        }
+
+        for (const auto& host : selected->second) {
+            if (
+                remote_host_labels_.find(host) !=
+                    remote_host_labels_.end() &&
+                remote_host_credential_saved_.find(host) !=
+                    remote_host_credential_saved_.end()
+            ) {
+                hosts.push_back(host);
+            }
+        }
+
+        return hosts;
+    }
+
+    nlohmann::json remote_shield_host_map_for_thread(
+        const std::string& thread_id
+    ) const {
+        nlohmann::json hosts =
+            nlohmann::json::object();
+
+        for (const auto& host :
+             remote_shield_hosts_for_thread(thread_id)) {
+            hosts[host] = host;
+        }
+
+        return hosts;
+    }
+
+    bool save_remote_host_credential(
+        const std::string& host,
+        const std::string& password
+    ) {
+        if (
+            password.empty() ||
+            password.find('\n') != std::string::npos ||
+            password.find('\r') != std::string::npos
+        ) {
+            Gtk::MessageDialog dialog(
+                *this,
+                "Enter a valid remote sudo password.",
+                false,
+                Gtk::MESSAGE_ERROR,
+                Gtk::BUTTONS_OK,
+                true);
+            dialog.set_secondary_text(
+                "The password cannot be empty or contain a newline.");
+            dialog.run();
+            return false;
+        }
+
+        std::string error;
+
+        if (!SecretStore::save_remote_sudo_password(
+                host,
+                password,
+                error)) {
+            Gtk::MessageDialog dialog(
+                *this,
+                "The remote sudo credential was not saved.",
+                false,
+                Gtk::MESSAGE_ERROR,
+                Gtk::BUTTONS_OK,
+                true);
+            dialog.set_secondary_text(error);
+            dialog.run();
+            return false;
+        }
+
+        remote_host_credential_saved_.insert(host);
+        ++codex_environment_generation_;
+        save_ui_state();
+        return true;
+    }
+
+    bool prompt_for_remote_host_credential(
+        const std::string& host
+    ) {
+        Gtk::Dialog dialog(
+            "Remote Shield credential",
+            *this,
+            true);
+        dialog.add_button("Cancel", Gtk::RESPONSE_CANCEL);
+        dialog.add_button("Save password", Gtk::RESPONSE_OK);
+        dialog.set_default_response(Gtk::RESPONSE_OK);
+
+        Gtk::Label explanation(
+            "Enter the sudo password for " + host +
+            ". It will be stored in Ubuntu's encrypted keyring.\n"
+            "SSH login itself must use your normal SSH key.");
+        explanation.set_xalign(0.0F);
+        explanation.set_line_wrap(true);
+        Gtk::Entry password_entry;
+        password_entry.set_visibility(false);
+        password_entry.set_activates_default(true);
+        password_entry.set_placeholder_text(
+            "Remote sudo password");
+
+        auto* area = dialog.get_content_area();
+        area->set_spacing(8);
+        area->set_border_width(12);
+        area->pack_start(
+            explanation,
+            Gtk::PACK_SHRINK);
+        area->pack_start(
+            password_entry,
+            Gtk::PACK_SHRINK);
+        dialog.show_all();
+        password_entry.grab_focus();
+
+        if (dialog.run() != Gtk::RESPONSE_OK) {
+            password_entry.set_text("");
+            return false;
+        }
+
+        std::string password =
+            password_entry.get_text().raw();
+        password_entry.set_text("");
+        const bool saved =
+            save_remote_host_credential(
+                host,
+                password);
+        std::fill(password.begin(), password.end(), '\0');
+        return saved;
+    }
+
+    void manage_remote_host_credential(
+        const std::string& host
+    ) {
+        const bool saved =
+            remote_host_credential_saved_.find(host) !=
+            remote_host_credential_saved_.end();
+        Gtk::Dialog dialog(
+            "Remote Shield credential",
+            *this,
+            true);
+        dialog.add_button("Cancel", Gtk::RESPONSE_CANCEL);
+
+        constexpr int kRemoveCredentialResponse = 1;
+
+        if (saved) {
+            dialog.add_button(
+                "Remove saved password",
+                kRemoveCredentialResponse);
+        }
+
+        dialog.add_button(
+            saved ? "Replace password" : "Save password",
+            Gtk::RESPONSE_OK);
+        dialog.set_default_response(Gtk::RESPONSE_OK);
+
+        Gtk::Label explanation(
+            saved
+                ? "A sudo password for " + host +
+                    " is saved in Ubuntu's encrypted keyring."
+                : "No sudo password is saved for " + host + ".");
+        explanation.set_xalign(0.0F);
+        explanation.set_line_wrap(true);
+        Gtk::Entry password_entry;
+        password_entry.set_visibility(false);
+        password_entry.set_activates_default(true);
+        password_entry.set_placeholder_text(
+            saved
+                ? "New remote sudo password"
+                : "Remote sudo password");
+        auto* area = dialog.get_content_area();
+        area->set_spacing(8);
+        area->set_border_width(12);
+        area->pack_start(
+            explanation,
+            Gtk::PACK_SHRINK);
+        area->pack_start(
+            password_entry,
+            Gtk::PACK_SHRINK);
+        dialog.show_all();
+        password_entry.grab_focus();
+
+        const int response = dialog.run();
+
+        if (response == kRemoveCredentialResponse) {
+            std::string error;
+
+            if (!SecretStore::clear_remote_sudo_password(
+                    host,
+                    error)) {
+                Gtk::MessageDialog failure(
+                    *this,
+                    "The saved credential was not removed.",
+                    false,
+                    Gtk::MESSAGE_ERROR,
+                    Gtk::BUTTONS_OK,
+                    true);
+                failure.set_secondary_text(error);
+                failure.run();
+                return;
+            }
+
+            remote_host_credential_saved_.erase(host);
+
+            for (auto& selected :
+                 thread_remote_shield_hosts_) {
+                selected.second.erase(host);
+            }
+
+            ++codex_environment_generation_;
+            save_ui_state();
+            refresh_remote_hosts_panel();
+            return;
+        }
+
+        if (response == Gtk::RESPONSE_OK) {
+            std::string password =
+                password_entry.get_text().raw();
+            password_entry.set_text("");
+            save_remote_host_credential(
+                host,
+                password);
+            std::fill(password.begin(), password.end(), '\0');
+            refresh_remote_hosts_panel();
+        }
+    }
+
+    void add_remote_host() {
+        Gtk::Dialog dialog(
+            "Add Remote Shield computer",
+            *this,
+            true);
+        dialog.add_button("Cancel", Gtk::RESPONSE_CANCEL);
+        dialog.add_button("Save", Gtk::RESPONSE_OK);
+        dialog.set_default_response(Gtk::RESPONSE_OK);
+
+        Gtk::Label host_label(
+            "SSH destination or alias");
+        host_label.set_xalign(0.0F);
+        Gtk::Entry host_entry;
+        host_entry.set_placeholder_text(
+            "example: alien or ronpatrick@192.168.0.130");
+        Gtk::Label password_label(
+            "Remote sudo password");
+        password_label.set_xalign(0.0F);
+        Gtk::Entry password_entry;
+        password_entry.set_visibility(false);
+        password_entry.set_activates_default(true);
+
+        auto* area = dialog.get_content_area();
+        area->set_spacing(6);
+        area->set_border_width(12);
+        area->pack_start(host_label, Gtk::PACK_SHRINK);
+        area->pack_start(host_entry, Gtk::PACK_SHRINK);
+        area->pack_start(password_label, Gtk::PACK_SHRINK);
+        area->pack_start(password_entry, Gtk::PACK_SHRINK);
+        dialog.show_all();
+        host_entry.grab_focus();
+
+        if (dialog.run() != Gtk::RESPONSE_OK) {
+            password_entry.set_text("");
+            return;
+        }
+
+        const std::string host =
+            trim(host_entry.get_text().raw());
+        std::string password =
+            password_entry.get_text().raw();
+        password_entry.set_text("");
+
+        if (!valid_remote_destination(host)) {
+            std::fill(password.begin(), password.end(), '\0');
+            Gtk::MessageDialog failure(
+                *this,
+                "Enter a valid SSH destination.",
+                false,
+                Gtk::MESSAGE_ERROR,
+                Gtk::BUTTONS_OK,
+                true);
+            failure.set_secondary_text(
+                "Use an SSH alias, hostname, address, or user@host without command-line options.");
+            failure.run();
+            return;
+        }
+
+        if (!save_remote_host_credential(host, password)) {
+            std::fill(password.begin(), password.end(), '\0');
+            return;
+        }
+
+        std::fill(password.begin(), password.end(), '\0');
+        remote_host_labels_[host] = host;
+
+        if (!current_thread_id_.empty()) {
+            thread_remote_shield_hosts_[
+                current_thread_id_].insert(host);
+        }
+
+        ++codex_environment_generation_;
+        save_ui_state();
+        refresh_remote_hosts_panel();
+    }
+
+    void handle_remote_host_toggled(
+        const std::string& host,
+        bool active
+    ) {
+        if (current_thread_id_.empty()) {
+            refresh_remote_hosts_panel();
+            return;
+        }
+
+        if (
+            active &&
+            remote_host_credential_saved_.find(host) ==
+                remote_host_credential_saved_.end() &&
+            !prompt_for_remote_host_credential(host)
+        ) {
+            refresh_remote_hosts_panel();
+            return;
+        }
+
+        auto& selected =
+            thread_remote_shield_hosts_[
+                current_thread_id_];
+
+        if (active) {
+            selected.insert(host);
+            status_label_.set_text(
+                "Remote Shield: " + host +
+                " enabled for this thread");
+        } else {
+            selected.erase(host);
+            status_label_.set_text(
+                "Remote Shield: " + host +
+                " disabled for this thread");
+        }
+
+        ++codex_environment_generation_;
+        save_ui_state();
+        refresh_remote_hosts_panel();
+    }
+
+    void refresh_remote_hosts_panel() {
+        const auto children =
+            remote_hosts_list_.get_children();
+
+        for (Gtk::Widget* child : children) {
+            remote_hosts_list_.remove(*child);
+        }
+
+        std::vector<std::string> hosts;
+
+        for (const auto& host : remote_host_labels_) {
+            hosts.push_back(host.first);
+        }
+
+        const auto observed =
+            thread_observed_remote_hosts_.find(
+                current_thread_id_);
+
+        std::stable_sort(
+            hosts.begin(),
+            hosts.end(),
+            [this, &observed](
+                const std::string& left,
+                const std::string& right
+            ) {
+                const bool left_observed =
+                    observed !=
+                        thread_observed_remote_hosts_.end() &&
+                    observed->second.find(left) !=
+                        observed->second.end();
+                const bool right_observed =
+                    observed !=
+                        thread_observed_remote_hosts_.end() &&
+                    observed->second.find(right) !=
+                        observed->second.end();
+
+                if (left_observed != right_observed) {
+                    return left_observed;
+                }
+
+                return
+                    Glib::ustring(
+                        remote_host_labels_.at(left))
+                        .casefold() <
+                    Glib::ustring(
+                        remote_host_labels_.at(right))
+                        .casefold();
+            });
+
+        if (hosts.empty()) {
+            auto* empty = Gtk::manage(
+                new Gtk::Label(
+                    "No SSH computers are configured.\n\nUse + to add one. Hosts from ~/.ssh/config also appear here."));
+            empty->set_xalign(0.0F);
+            empty->set_line_wrap(true);
+            remote_hosts_list_.pack_start(
+                *empty,
+                Gtk::PACK_SHRINK);
+        }
+
+        for (const auto& host : hosts) {
+            auto* row = Gtk::manage(
+                new Gtk::Box(
+                    Gtk::ORIENTATION_HORIZONTAL));
+            row->set_spacing(4);
+            auto* enabled = Gtk::manage(
+                new Gtk::CheckButton(
+                    remote_host_labels_.at(host)));
+            enabled->set_hexpand(true);
+            enabled->set_halign(Gtk::ALIGN_FILL);
+            const auto selected =
+                thread_remote_shield_hosts_.find(
+                    current_thread_id_);
+            enabled->set_active(
+                selected !=
+                    thread_remote_shield_hosts_.end() &&
+                selected->second.find(host) !=
+                    selected->second.end());
+            enabled->set_sensitive(
+                !current_thread_id_.empty());
+            enabled->set_tooltip_text(
+                remote_host_credential_saved_.find(host) !=
+                        remote_host_credential_saved_.end()
+                    ? "Enable this saved remote sudo credential for the current thread"
+                    : "No sudo password is saved; enabling will ask for it");
+            enabled->signal_toggled().connect(
+                [this, host, enabled]() {
+                    handle_remote_host_toggled(
+                        host,
+                        enabled->get_active());
+                });
+
+            auto* credential = Gtk::manage(
+                new Gtk::Button());
+            auto* credential_image = Gtk::manage(
+                new Gtk::Image());
+            credential_image->set_from_icon_name(
+                "dialog-password-symbolic",
+                Gtk::ICON_SIZE_BUTTON);
+            credential->set_image(*credential_image);
+            credential->set_always_show_image(true);
+            credential->set_relief(Gtk::RELIEF_NONE);
+            credential->set_tooltip_text(
+                remote_host_credential_saved_.find(host) !=
+                        remote_host_credential_saved_.end()
+                    ? "Replace or remove the saved sudo password"
+                    : "Save the remote sudo password");
+            credential->signal_clicked().connect(
+                [this, host]() {
+                    manage_remote_host_credential(host);
+                });
+
+            row->pack_start(
+                *enabled,
+                Gtk::PACK_EXPAND_WIDGET);
+            row->pack_end(
+                *credential,
+                Gtk::PACK_SHRINK);
+            remote_hosts_list_.pack_start(
+                *row,
+                Gtk::PACK_SHRINK);
+        }
+
+        remote_hosts_list_.show_all_children();
+
+        const bool any_enabled =
+            !remote_shield_hosts_for_thread(
+                current_thread_id_).empty();
+        auto style =
+            remote_shield_button_.get_style_context();
+
+        if (any_enabled) {
+            style->add_class("remote-shield-active");
+        } else {
+            style->remove_class("remote-shield-active");
+        }
+    }
+
+    void apply_remote_hosts_panel_visibility() {
+        remote_shield_button_updating_ = true;
+        remote_shield_button_.set_active(
+            remote_hosts_panel_visible_);
+        remote_shield_button_updating_ = false;
+
+        if (remote_hosts_panel_visible_) {
+            refresh_remote_hosts_panel();
+            remote_hosts_panel_.show_all_children();
+            remote_hosts_panel_.show();
+
+            const int allocated_width =
+                main_workspace_.get_allocated_width();
+
+            if (allocated_width > 420) {
+                main_workspace_.set_position(
+                    std::max(
+                        180,
+                        allocated_width - 310));
+            }
+        } else {
+            remote_hosts_panel_.hide();
+        }
+    }
+
+    void handle_remote_shield_panel_toggled() {
+        if (remote_shield_button_updating_) {
+            return;
+        }
+
+        remote_hosts_panel_visible_ =
+            remote_shield_button_.get_active();
+        apply_remote_hosts_panel_visibility();
+        save_ui_state();
     }
 
     static int run_program(
@@ -3651,6 +4953,234 @@ private:
                         ? "Enable sudo commands for this thread"
                         : "Authenticate once and enable sudo commands for this thread"
                 ));
+    }
+
+    void update_auto_copy_button() {
+        const bool enabled =
+            !current_thread_id_.empty() &&
+            thread_auto_copy_selections_.find(
+                current_thread_id_) !=
+                thread_auto_copy_selections_.end();
+
+        auto_copy_button_updating_ = true;
+        auto_copy_button_.set_active(enabled);
+        auto_copy_button_updating_ = false;
+        auto_copy_button_.set_sensitive(
+            !current_thread_id_.empty());
+        auto_copy_button_.set_tooltip_text(
+            enabled
+                ? "Auto-copy is enabled for this thread; newly completed shell command blocks copy to the clipboard while this thread is focused"
+                : "Automatically copy newly completed shell command blocks while this thread is focused");
+    }
+
+    void handle_auto_copy_toggled() {
+        if (auto_copy_button_updating_) {
+            return;
+        }
+
+        if (current_thread_id_.empty()) {
+            update_auto_copy_button();
+            return;
+        }
+
+        if (auto_copy_button_.get_active()) {
+            thread_auto_copy_selections_.insert(
+                current_thread_id_);
+            status_label_.set_text(
+                "Codex: command auto-copy enabled for this thread");
+        } else {
+            thread_auto_copy_selections_.erase(
+                current_thread_id_);
+            status_label_.set_text(
+                "Codex: command auto-copy disabled for this thread");
+        }
+
+        save_ui_state();
+        update_auto_copy_button();
+    }
+
+    void update_pause_button() {
+        const bool has_thread =
+            !current_thread_id_.empty();
+        const bool paused =
+            has_thread &&
+            paused_threads_.find(current_thread_id_) !=
+                paused_threads_.end();
+        const bool pause_requested =
+            has_thread &&
+            pause_requested_threads_.find(
+                current_thread_id_) !=
+                pause_requested_threads_.end();
+
+        ThreadTurnSession* session =
+            has_thread
+                ? find_turn_session(current_thread_id_)
+                : nullptr;
+        const bool busy =
+            session != nullptr && session->busy;
+        const bool running_turn =
+            busy &&
+            session->work_kind ==
+                SessionWorkKind::Turn &&
+            !session->stop_requested;
+
+        pause_image_.set_from_icon_name(
+            paused
+                ? "media-playback-start-symbolic"
+                : "media-playback-pause-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+
+        auto style =
+            pause_button_.get_style_context();
+        if (paused || pause_requested) {
+            style->add_class("pause-active");
+        } else {
+            style->remove_class("pause-active");
+        }
+
+        pause_button_.set_sensitive(
+            has_thread &&
+            !pause_requested &&
+            (
+                paused
+                    ? !busy
+                    : (!busy || running_turn)
+            ));
+
+        if (paused) {
+            pause_button_.set_tooltip_text(
+                "Resume this thread from its saved checkpoint");
+        } else if (pause_requested) {
+            pause_button_.set_tooltip_text(
+                "Codex is preparing a safe checkpoint");
+        } else if (running_turn) {
+            pause_button_.set_tooltip_text(
+                "Ask Codex to reach a safe checkpoint and pause");
+        } else {
+            pause_button_.set_tooltip_text(
+                "Mark this idle thread as paused");
+        }
+    }
+
+    void handle_pause_clicked() {
+        if (current_thread_id_.empty()) {
+            return;
+        }
+
+        const std::string thread_id =
+            current_thread_id_;
+        ThreadTurnSession* session =
+            find_turn_session(thread_id);
+
+        if (
+            paused_threads_.find(thread_id) !=
+                paused_threads_.end()
+        ) {
+            if (session != nullptr && session->busy) {
+                status_label_.set_text(
+                    "Codex: this paused thread is already busy");
+                update_pause_button();
+                return;
+            }
+
+            paused_threads_.erase(thread_id);
+            save_ui_state();
+            update_pause_button();
+
+            nlohmann::json turn_input =
+                nlohmann::json::array();
+            turn_input.push_back(
+                {
+                    {"type", "text"},
+                    {
+                        "text",
+                        "Continue from the last safe checkpoint and resume the unfinished task."
+                    },
+                    {
+                        "text_elements",
+                        nlohmann::json::array()
+                    },
+                });
+
+            append_user_content_to_transcript(
+                turn_input);
+            start_structured_turn(
+                thread_id,
+                turn_input,
+                turn_input,
+                current_session_options());
+            return;
+        }
+
+        if (session == nullptr || !session->busy) {
+            paused_threads_.insert(thread_id);
+            status_label_.set_text(
+                "Codex: thread paused at its current checkpoint");
+            save_ui_state();
+            update_pause_button();
+            return;
+        }
+
+        if (
+            session->work_kind !=
+                SessionWorkKind::Turn ||
+            session->stop_requested
+        ) {
+            status_label_.set_text(
+                "Codex: this thread cannot pause safely yet");
+            update_pause_button();
+            return;
+        }
+
+        PendingFollowUp follow_up;
+        follow_up.entry_id =
+            "threaddeck-pause-" +
+            std::to_string(++follow_up_sequence_);
+        follow_up.input.push_back(
+            {
+                {"type", "text"},
+                {
+                    "text",
+                    "Find a safe place to pause. Finish only the operation currently in progress so the workspace is left coherent. Record a concise checkpoint of completed work and the exact next step, then end this turn. Do not begin additional work."
+                },
+                {
+                    "text_elements",
+                    nlohmann::json::array()
+                },
+            });
+
+        LiveTurnEntry entry;
+        entry.kind = LiveEntryKind::FollowUp;
+        entry.item_id = follow_up.entry_id;
+        entry.state = "queued";
+        entry.text =
+            "Pause requested: reach a safe checkpoint and end this turn.";
+        session->live_entries.push_back(
+            std::move(entry));
+
+        bool accepted = false;
+        if (session->active_turn_id.empty()) {
+            session->pending_follow_ups.push_back(
+                std::move(follow_up));
+            accepted = true;
+            status_label_.set_text(
+                "Codex: safe-pause request queued");
+        } else if (send_follow_up(*session, follow_up)) {
+            accepted = true;
+            status_label_.set_text(
+                "Codex: preparing a safe checkpoint");
+        } else {
+            status_label_.set_text(
+                "Codex: safe-pause request could not be sent");
+        }
+
+        if (accepted) {
+            pause_requested_threads_.insert(thread_id);
+        }
+
+        render_live_turn(*session);
+        update_pause_button();
+        update_send_button_state();
     }
 
     void start_shield_operation(
@@ -4149,6 +5679,11 @@ private:
                     "contextPanelVisible",
                     true);
 
+            remote_hosts_panel_visible_ =
+                state.value(
+                    "remoteHostsPanelVisible",
+                    false);
+
             context_panel_width_ =
                 std::clamp(
                     state.value(
@@ -4306,6 +5841,87 @@ private:
                             thread_id.get<std::string>());
                     }
                 }
+            }
+
+            if (
+                state.contains("threadAutoCopySelections") &&
+                state["threadAutoCopySelections"].is_array()
+            ) {
+                for (const auto& thread_id :
+                     state["threadAutoCopySelections"]) {
+                    if (
+                        thread_id.is_string() &&
+                        !thread_id.get<std::string>().empty()
+                    ) {
+                        thread_auto_copy_selections_.insert(
+                            thread_id.get<std::string>());
+                    }
+                }
+            }
+
+            if (
+                state.contains("remoteHostLabels") &&
+                state["remoteHostLabels"].is_object()
+            ) {
+                remote_host_labels_ =
+                    state["remoteHostLabels"].get<
+                        std::map<std::string, std::string>>();
+            }
+
+            if (
+                state.contains("remoteHostCredentialSaved") &&
+                state["remoteHostCredentialSaved"].is_array()
+            ) {
+                remote_host_credential_saved_ =
+                    state["remoteHostCredentialSaved"].get<
+                        std::set<std::string>>();
+            }
+
+            if (
+                state.contains("threadRemoteShieldHosts") &&
+                state["threadRemoteShieldHosts"].is_object()
+            ) {
+                thread_remote_shield_hosts_ =
+                    state["threadRemoteShieldHosts"].get<
+                        std::map<
+                            std::string,
+                            std::set<std::string>>>();
+            }
+
+            if (
+                state.contains("threadObservedRemoteHosts") &&
+                state["threadObservedRemoteHosts"].is_object()
+            ) {
+                thread_observed_remote_hosts_ =
+                    state["threadObservedRemoteHosts"].get<
+                        std::map<
+                            std::string,
+                            std::set<std::string>>>();
+            }
+
+            if (
+                state.contains("pausedThreads") &&
+                state["pausedThreads"].is_array()
+            ) {
+                for (const auto& thread_id :
+                     state["pausedThreads"]) {
+                    if (
+                        thread_id.is_string() &&
+                        !thread_id.get<std::string>().empty()
+                    ) {
+                        paused_threads_.insert(
+                            thread_id.get<std::string>());
+                    }
+                }
+            }
+
+            if (
+                state.contains("threadModelSelections") &&
+                state["threadModelSelections"].is_object()
+            ) {
+                thread_model_selections_ =
+                    state["threadModelSelections"].get<
+                        std::map<std::string, std::string>>();
             }
 
             if (
@@ -4504,12 +6120,40 @@ private:
                     thread_access_selections_,
                 },
                 {
+                    "threadModelSelections",
+                    thread_model_selections_,
+                },
+                {
                     "threadReasoningSelections",
                     thread_reasoning_selections_,
                 },
                 {
                     "threadShieldSelections",
                     thread_shield_selections_,
+                },
+                {
+                    "threadAutoCopySelections",
+                    thread_auto_copy_selections_,
+                },
+                {
+                    "remoteHostLabels",
+                    remote_host_labels_,
+                },
+                {
+                    "remoteHostCredentialSaved",
+                    remote_host_credential_saved_,
+                },
+                {
+                    "threadRemoteShieldHosts",
+                    thread_remote_shield_hosts_,
+                },
+                {
+                    "threadObservedRemoteHosts",
+                    thread_observed_remote_hosts_,
+                },
+                {
+                    "pausedThreads",
+                    paused_threads_,
                 },
                 {
                     "threadProjectAssignments",
@@ -4558,6 +6202,10 @@ private:
                 {
                     "contextPanelVisible",
                     context_panel_visible_,
+                },
+                {
+                    "remoteHostsPanelVisible",
+                    remote_hosts_panel_visible_,
                 },
                 {
                     "contextPanelWidth",
@@ -4734,29 +6382,72 @@ private:
         }
     }
 
+    void capture_main_window_geometry() {
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+
+        get_position(x, y);
+        get_size(width, height);
+
+        if (!main_window_maximized_) {
+            main_window_x_ = x;
+            main_window_y_ = y;
+            main_window_width_ = std::max(width, 640);
+            main_window_height_ = std::max(height, 480);
+            main_window_has_geometry_ = true;
+        }
+
+        const auto screen =
+            Gdk::Screen::get_default();
+
+        if (screen && width > 0 && height > 0) {
+            main_window_monitor_ =
+                screen->get_monitor_at_point(
+                    x + (width / 2),
+                    y + (height / 2));
+        }
+    }
+
+    bool save_main_window_state_after_delay() {
+        main_window_state_save_pending_ = false;
+        capture_main_window_geometry();
+        save_ui_state();
+        return false;
+    }
+
+    void schedule_main_window_state_save() {
+        if (main_window_state_save_pending_) {
+            return;
+        }
+
+        main_window_state_save_pending_ = true;
+        Glib::signal_timeout().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::save_main_window_state_after_delay),
+            500);
+    }
+
     bool handle_main_window_configure(
         GdkEventConfigure* event
     ) {
-        if (
-            event == nullptr ||
-            main_window_maximized_
-        ) {
+        if (event == nullptr) {
             return false;
         }
 
-        main_window_x_ =
-            event->x;
-
-        main_window_y_ =
-            event->y;
-
-        main_window_width_ =
-            event->width;
-
-        main_window_height_ =
-            event->height;
-
-        main_window_has_geometry_ = true;
+        if (!main_window_maximized_) {
+            main_window_x_ =
+                event->x;
+            main_window_y_ =
+                event->y;
+            main_window_width_ =
+                event->width;
+            main_window_height_ =
+                event->height;
+            main_window_has_geometry_ = true;
+        }
 
         const auto screen =
             Gdk::Screen::get_default();
@@ -4764,11 +6455,13 @@ private:
         if (screen) {
             main_window_monitor_ =
                 screen->get_monitor_at_point(
-                    main_window_x_ +
-                        (main_window_width_ / 2),
-                    main_window_y_ +
-                        (main_window_height_ / 2));
+                    event->x +
+                        (event->width / 2),
+                    event->y +
+                        (event->height / 2));
         }
+
+        schedule_main_window_state_save();
 
         return false;
     }
@@ -4786,12 +6479,16 @@ private:
                 GDK_WINDOW_STATE_MAXIMIZED
             ) != 0;
 
+        capture_main_window_geometry();
+        schedule_main_window_state_save();
+
         return false;
     }
 
     bool handle_main_window_delete(
         GdkEventAny*
     ) {
+        capture_main_window_geometry();
         save_ui_state();
 
         std::cout
@@ -5094,6 +6791,44 @@ headerbar.threaddeck-header {
     background-color: alpha(#c94f4f, 0.40);
 }
 
+.auto-copy-button:checked {
+    background-image: none;
+    background-color: #d5a000;
+    color: #181300;
+    border-color: #ffd45c;
+}
+
+.auto-copy-button:checked:hover {
+    background-color: #e4af00;
+}
+
+.thread-pause-button.pause-active {
+    background-image: none;
+    background-color: alpha(#d5a000, 0.38);
+    color: #ffe7a3;
+    border-color: alpha(#ffd45c, 0.68);
+}
+
+.thread-pause-button.pause-active:hover {
+    background-color: alpha(#d5a000, 0.50);
+}
+
+.remote-shield-button.remote-shield-active {
+    background-image: none;
+    background-color: alpha(#c94f4f, 0.32);
+    color: #ffdede;
+    border-color: alpha(#ef7777, 0.58);
+}
+
+.remote-shield-button.remote-shield-active:hover {
+    background-color: alpha(#c94f4f, 0.40);
+}
+
+.remote-hosts-panel {
+    background-color: shade(@theme_bg_color, 0.96);
+    border-left: 1px solid alpha(@theme_fg_color, 0.14);
+}
+
 .settings-root {
     background-color: @theme_bg_color;
 }
@@ -5116,6 +6851,50 @@ headerbar.threaddeck-header {
 .threaddeck-sidebar {
     background-color: shade(@theme_bg_color, 0.96);
     border-right: 1px solid alpha(@theme_fg_color, 0.14);
+}
+
+#sidebar-thread-search {
+    background-image: none;
+    background-color: @theme_base_color;
+    color: @theme_text_color;
+    border: 1px solid alpha(@theme_fg_color, 0.22);
+    border-radius: 9px;
+    box-shadow: none;
+}
+
+#sidebar-thread-search:focus {
+    border-color: alpha(@theme_selected_bg_color, 0.72);
+    box-shadow: 0 0 0 1px alpha(@theme_selected_bg_color, 0.24);
+}
+
+#sidebar-thread-search image {
+    color: alpha(@theme_text_color, 0.78);
+}
+
+#sidebar-thread-scroll scrollbar {
+    background-color: transparent;
+}
+
+#sidebar-thread-scroll scrollbar trough {
+    background-color: alpha(@theme_fg_color, 0.055);
+    border: 1px solid alpha(@theme_fg_color, 0.10);
+    border-radius: 999px;
+}
+
+#sidebar-thread-scroll scrollbar slider {
+    min-width: 8px;
+    min-height: 32px;
+    background-color: alpha(@theme_fg_color, 0.32);
+    border: 1px solid alpha(@theme_fg_color, 0.12);
+    border-radius: 999px;
+}
+
+#sidebar-thread-scroll scrollbar slider:hover {
+    background-color: alpha(@theme_selected_bg_color, 0.62);
+}
+
+#sidebar-thread-scroll scrollbar slider:active {
+    background-color: @theme_selected_bg_color;
 }
 
 .threaddeck-content {
@@ -5273,6 +7052,41 @@ button.approval-danger-button {
 .thread-row.active-thread {
     background-color: alpha(@theme_selected_bg_color, 0.22);
     font-weight: bold;
+}
+
+.thread-row.working-thread {
+    background-image: none;
+    background-color: rgba(205, 159, 45, 0.18);
+    border-color: rgba(205, 159, 45, 0.55);
+}
+
+.thread-row.working-thread:hover {
+    background-color: rgba(205, 159, 45, 0.26);
+}
+
+.thread-row.question-thread {
+    background-image: none;
+    background-color: rgba(205, 159, 45, 0.14);
+    border-color: rgba(205, 159, 45, 0.62);
+    transition: background-color 320ms ease-in-out;
+}
+
+.thread-row.question-thread.question-blink {
+    background-color: rgba(225, 179, 55, 0.34);
+}
+
+.thread-row.completed-thread {
+    background-image: none;
+    background-color: rgba(55, 158, 91, 0.16);
+    border-color: rgba(55, 158, 91, 0.46);
+}
+
+.thread-row.completed-thread:hover {
+    background-color: rgba(55, 158, 91, 0.24);
+}
+
+.working-spinner {
+    color: #d6a535;
 }
 
 .sidebar-label-editor {
@@ -5571,9 +7385,51 @@ button.approval-danger-button {
         transcript_user_section_tag_ =
             transcript_buffer->create_tag(
                 "threaddeck-user-section");
+        transcript_user_marker_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-user-marker");
+        transcript_user_top_padding_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-user-top-padding");
+        transcript_user_bottom_padding_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-user-bottom-padding");
+        transcript_expand_activity_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-expand-activity");
+        transcript_expand_token_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-expand-token");
         transcript_code_tag_ =
             transcript_buffer->create_tag(
                 "threaddeck-code");
+        transcript_code_header_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-code-header");
+        transcript_code_copy_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-code-copy");
+        transcript_markdown_marker_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-marker");
+        transcript_markdown_heading_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-heading");
+        transcript_markdown_bold_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-bold");
+        transcript_markdown_inline_code_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-inline-code");
+        transcript_markdown_quote_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-quote");
+        transcript_markdown_list_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-list");
+        transcript_markdown_link_tag_ =
+            transcript_buffer->create_tag(
+                "threaddeck-markdown-link");
         transcript_code_keyword_tag_ =
             transcript_buffer->create_tag(
                 "threaddeck-code-keyword");
@@ -5621,6 +7477,8 @@ button.approval-danger-button {
             const auto& tag :
             {
                 transcript_code_tag_,
+                transcript_code_header_tag_,
+                transcript_code_copy_tag_,
                 transcript_code_keyword_tag_,
                 transcript_code_string_tag_,
                 transcript_code_comment_tag_,
@@ -5646,6 +7504,80 @@ button.approval-danger-button {
             ->property_left_margin() = 10;
         transcript_user_section_tag_
             ->property_right_margin() = 10;
+        // GTK 3 can abort in its mouse-position mapping when a text
+        // layout contains invisible tagged runs. Keep internal markers
+        // in the normal layout, but make them visually negligible.
+        transcript_user_marker_tag_
+            ->property_scale() = 0.01;
+        transcript_user_top_padding_tag_
+            ->property_pixels_above_lines() = 10;
+        transcript_user_bottom_padding_tag_
+            ->property_pixels_below_lines() = 10;
+        transcript_expand_activity_tag_
+            ->property_underline() =
+                Pango::UNDERLINE_SINGLE;
+        transcript_expand_token_tag_
+            ->property_scale() = 0.01;
+        transcript_expand_activity_tag_
+            ->signal_event().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::handle_activity_expand_event));
+        transcript_code_copy_tag_
+            ->property_weight() =
+                Pango::WEIGHT_NORMAL;
+        transcript_code_copy_tag_
+            ->property_family() = "sans";
+        transcript_code_copy_tag_
+            ->property_style() =
+                Pango::STYLE_NORMAL;
+        transcript_code_copy_tag_
+            ->property_scale() = 1.1;
+        transcript_code_copy_tag_
+            ->property_underline() =
+                Pango::UNDERLINE_NONE;
+        transcript_code_copy_tag_
+            ->signal_event().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::handle_code_copy_event));
+        transcript_code_header_tag_
+            ->property_style() =
+                Pango::STYLE_NORMAL;
+        transcript_code_header_tag_
+            ->property_weight() =
+                Pango::WEIGHT_BOLD;
+        transcript_markdown_marker_tag_
+            ->property_scale() = 0.01;
+        transcript_markdown_heading_tag_
+            ->property_weight() =
+                Pango::WEIGHT_BOLD;
+        transcript_markdown_heading_tag_
+            ->property_scale() = 1.12;
+        transcript_markdown_heading_tag_
+            ->property_pixels_above_lines() = 8;
+        transcript_markdown_heading_tag_
+            ->property_pixels_below_lines() = 3;
+        transcript_markdown_bold_tag_
+            ->property_weight() =
+                Pango::WEIGHT_BOLD;
+        transcript_markdown_inline_code_tag_
+            ->property_family() = "monospace";
+        transcript_markdown_quote_tag_
+            ->property_left_margin() = 16;
+        transcript_markdown_quote_tag_
+            ->property_style() =
+                Pango::STYLE_ITALIC;
+        transcript_markdown_list_tag_
+            ->property_left_margin() = 16;
+        transcript_markdown_link_tag_
+            ->property_underline() =
+                Pango::UNDERLINE_SINGLE;
+        transcript_markdown_link_tag_
+            ->signal_event().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::handle_markdown_link_event));
 
         refresh_text_tag_colors();
         apply_transcript_tags(0);
@@ -5675,6 +7607,20 @@ button.approval-danger-button {
             text_color(dark ? "#d2a8ff" : "#75519a");
         transcript_activity_tag_->property_foreground_rgba() =
             text_color(dark ? "#e3b341" : "#8a5b00");
+        transcript_expand_activity_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#79c0ff" : "#245f91");
+        const Gdk::RGBA transparent_text =
+            text_color("rgba(0, 0, 0, 0)");
+        transcript_user_marker_tag_
+            ->property_foreground_rgba() =
+            transparent_text;
+        transcript_expand_token_tag_
+            ->property_foreground_rgba() =
+            transparent_text;
+        transcript_markdown_marker_tag_
+            ->property_foreground_rgba() =
+            transparent_text;
         transcript_error_tag_->property_foreground_rgba() =
             text_color(dark ? "#ff7b72" : "#b42318");
         transcript_user_section_tag_
@@ -5686,6 +7632,45 @@ button.approval-danger-button {
 
         transcript_code_tag_->property_foreground_rgba() =
             text_color(dark ? "#c9d1d9" : "#263238");
+        transcript_code_tag_
+            ->property_paragraph_background_rgba() =
+            text_color(
+                dark
+                    ? "rgba(255, 255, 255, 0.035)"
+                    : "rgba(30, 41, 59, 0.045)");
+        transcript_code_header_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#c9d1d9" : "#263238");
+        transcript_code_header_tag_
+            ->property_paragraph_background_rgba() =
+            text_color(
+                dark
+                    ? "rgba(255, 255, 255, 0.09)"
+                    : "rgba(30, 41, 59, 0.10)");
+        transcript_code_copy_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#79c0ff" : "#245f91");
+        transcript_code_copy_tag_
+            ->property_background_rgba() =
+            text_color(
+                dark
+                    ? "rgba(121, 192, 255, 0.12)"
+                    : "rgba(36, 95, 145, 0.10)");
+        transcript_markdown_inline_code_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#f0b8ff" : "#704080");
+        transcript_markdown_inline_code_tag_
+            ->property_background_rgba() =
+            text_color(
+                dark
+                    ? "rgba(255, 255, 255, 0.07)"
+                    : "rgba(30, 41, 59, 0.08)");
+        transcript_markdown_quote_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#aeb8c5" : "#586474");
+        transcript_markdown_link_tag_
+            ->property_foreground_rgba() =
+            text_color(dark ? "#58a6ff" : "#0969da");
         transcript_code_keyword_tag_->property_foreground_rgba() =
             text_color(dark ? "#d2a8ff" : "#7c3aed");
         transcript_code_string_tag_->property_foreground_rgba() =
@@ -5776,6 +7761,18 @@ button.approval-danger-button {
             << palette->foreground_color
             << ";\n"
             << "    border-color: "
+            << palette->shade_color
+            << ";\n"
+            << "}\n\n"
+
+            << ".remote-hosts-panel {\n"
+            << "    background-color: "
+            << palette->sidebar_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-left: 1px solid "
             << palette->shade_color
             << ";\n"
             << "}\n\n"
@@ -5905,6 +7902,39 @@ button.approval-danger-button {
             << "    background-color: rgba(157, 56, 56, 0.90);\n"
             << "}\n\n"
 
+            << "button.auto-copy-button:checked {\n"
+            << "    background-image: none;\n"
+            << "    background-color: #d5a000;\n"
+            << "    color: #181300;\n"
+            << "    border-color: #ffd45c;\n"
+            << "}\n\n"
+
+            << "button.auto-copy-button:checked:hover {\n"
+            << "    background-color: #e4af00;\n"
+            << "}\n\n"
+
+            << "button.thread-pause-button.pause-active {\n"
+            << "    background-image: none;\n"
+            << "    background-color: rgba(175, 132, 0, 0.48);\n"
+            << "    color: #ffe7a3;\n"
+            << "    border-color: #d7ad3f;\n"
+            << "}\n\n"
+
+            << "button.thread-pause-button.pause-active:hover {\n"
+            << "    background-color: rgba(191, 145, 0, 0.58);\n"
+            << "}\n\n"
+
+            << "button.remote-shield-button.remote-shield-active {\n"
+            << "    background-image: none;\n"
+            << "    background-color: rgba(139, 48, 48, 0.82);\n"
+            << "    color: #ffe7e7;\n"
+            << "    border-color: #c96464;\n"
+            << "}\n\n"
+
+            << "button.remote-shield-button.remote-shield-active:hover {\n"
+            << "    background-color: rgba(157, 56, 56, 0.90);\n"
+            << "}\n\n"
+
             << ".thread-row:hover {\n"
             << "    background-color: alpha("
             << palette->accent_bg_color
@@ -5918,6 +7948,41 @@ button.approval-danger-button {
             << "    color: "
             << palette->foreground_color
             << ";\n"
+            << "}\n\n"
+
+            << ".thread-row.working-thread {\n"
+            << "    background-image: none;\n"
+            << "    background-color: rgba(205, 159, 45, 0.18);\n"
+            << "    border-color: rgba(205, 159, 45, 0.55);\n"
+            << "}\n\n"
+
+            << ".thread-row.working-thread:hover {\n"
+            << "    background-color: rgba(205, 159, 45, 0.26);\n"
+            << "}\n\n"
+
+            << ".thread-row.question-thread {\n"
+            << "    background-image: none;\n"
+            << "    background-color: rgba(205, 159, 45, 0.14);\n"
+            << "    border-color: rgba(205, 159, 45, 0.62);\n"
+            << "    transition: background-color 320ms ease-in-out;\n"
+            << "}\n\n"
+
+            << ".thread-row.question-thread.question-blink {\n"
+            << "    background-color: rgba(225, 179, 55, 0.34);\n"
+            << "}\n\n"
+
+            << ".thread-row.completed-thread {\n"
+            << "    background-image: none;\n"
+            << "    background-color: rgba(55, 158, 91, 0.16);\n"
+            << "    border-color: rgba(55, 158, 91, 0.46);\n"
+            << "}\n\n"
+
+            << ".thread-row.completed-thread:hover {\n"
+            << "    background-color: rgba(55, 158, 91, 0.24);\n"
+            << "}\n\n"
+
+            << ".working-spinner {\n"
+            << "    color: #d6a535;\n"
             << "}\n\n"
 
             << ".send-button {\n"
@@ -5990,6 +8055,35 @@ button.approval-danger-button {
             << ";\n"
             << "}\n\n"
 
+            << "#sidebar-thread-search {\n"
+            << "    background-image: none;\n"
+            << "    background-color: "
+            << palette->card_bg_color
+            << ";\n"
+            << "    color: "
+            << palette->foreground_color
+            << ";\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "    box-shadow: none;\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-search:focus {\n"
+            << "    border-color: "
+            << palette->accent_bg_color
+            << ";\n"
+            << "    box-shadow: 0 0 0 1px alpha("
+            << palette->accent_bg_color
+            << ", 0.24);\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-search image {\n"
+            << "    color: alpha("
+            << palette->foreground_color
+            << ", 0.78);\n"
+            << "}\n\n"
+
             << "scrollbar slider {\n"
             << "    background-color: alpha("
             << palette->foreground_color
@@ -5999,6 +8093,40 @@ button.approval-danger-button {
             << "scrollbar trough {\n"
             << "    border-color: "
             << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-scroll scrollbar {\n"
+            << "    background-color: transparent;\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-scroll scrollbar trough {\n"
+            << "    background-color: alpha("
+            << palette->foreground_color
+            << ", 0.055);\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-scroll scrollbar slider {\n"
+            << "    background-color: alpha("
+            << palette->foreground_color
+            << ", 0.34);\n"
+            << "    border-color: "
+            << palette->scrollbar_outline_color
+            << ";\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-scroll scrollbar slider:hover {\n"
+            << "    background-color: alpha("
+            << palette->accent_bg_color
+            << ", 0.62);\n"
+            << "}\n\n"
+
+            << "#sidebar-thread-scroll scrollbar slider:active {\n"
+            << "    background-color: "
+            << palette->accent_bg_color
             << ";\n"
             << "}\n";
 
@@ -6138,19 +8266,18 @@ button.approval-danger-button {
     }
 
     void receive_clipboard_image(
-        const Glib::RefPtr<Gdk::Pixbuf>& image
+        const Glib::RefPtr<Gdk::Pixbuf>& image,
+        const std::string& target_thread_id
     ) {
         if (!image) {
-            status_label_.set_text(
-                "Codex: clipboard image could not be read");
+            if (target_thread_id == current_thread_id_) {
+                status_label_.set_text(
+                    "Codex: clipboard image could not be read");
+            }
             return;
         }
 
-        if (
-            turn_in_progress_ ||
-            shell_command_in_progress_ ||
-            current_thread_id_.empty()
-        ) {
+        if (target_thread_id.empty()) {
             return;
         }
 
@@ -6200,14 +8327,22 @@ button.approval-danger-button {
         const std::string path =
             image_path.string();
 
-        attached_image_paths_.push_back(path);
-        queued_temporary_attachment_paths_.push_back(path);
+        if (target_thread_id == composer_thread_id_) {
+            attached_image_paths_.push_back(path);
+            queued_temporary_attachment_paths_.push_back(path);
+            refresh_attachment_row();
+            update_send_button_state();
 
-        refresh_attachment_row();
-        update_send_button_state();
-
-        status_label_.set_text(
-            "Codex: screenshot queued for the next message");
+            status_label_.set_text(
+                turn_in_progress_
+                    ? "Codex: screenshot queued for the follow-up"
+                    : "Codex: screenshot queued for the next message");
+        } else {
+            ComposerDraft& draft =
+                composer_drafts_[target_thread_id];
+            draft.image_paths.push_back(path);
+            draft.temporary_attachment_paths.push_back(path);
+        }
 
         std::cout
             << "PASS: queued clipboard image attachment "
@@ -6217,9 +8352,7 @@ button.approval-danger-button {
 
     bool paste_clipboard_image() {
         if (
-            turn_in_progress_ ||
-            shell_command_in_progress_ ||
-            current_thread_id_.empty()
+            !current_composer_accepts_attachments()
         ) {
             return false;
         }
@@ -6237,11 +8370,495 @@ button.approval-danger-button {
         status_label_.set_text(
             "Codex: reading screenshot from clipboard");
 
+        const std::string target_thread_id =
+            current_thread_id_;
         clipboard->request_image(
-            sigc::mem_fun(
-                *this,
-                &MainWindow::receive_clipboard_image));
+            [this, target_thread_id](
+                const Glib::RefPtr<Gdk::Pixbuf>& image
+            ) {
+                receive_clipboard_image(
+                    image,
+                    target_thread_id);
+            });
 
+        return true;
+    }
+
+    PromptEditSnapshot capture_prompt_edit_snapshot() {
+        PromptEditSnapshot snapshot;
+        const auto buffer = prompt_.get_buffer();
+
+        if (!buffer) {
+            return snapshot;
+        }
+
+        snapshot.text = buffer->get_text();
+        snapshot.insert_offset =
+            buffer->get_iter_at_mark(
+                buffer->get_insert()).get_offset();
+        snapshot.selection_bound_offset =
+            buffer->get_iter_at_mark(
+                buffer->get_selection_bound()).get_offset();
+
+        if (!prompt_pasted_tag_) {
+            return snapshot;
+        }
+
+        auto position = buffer->begin();
+        const auto end = buffer->end();
+
+        while (position != end) {
+            if (!position.has_tag(prompt_pasted_tag_)) {
+                if (!position.forward_to_tag_toggle(
+                        prompt_pasted_tag_)) {
+                    break;
+                }
+            }
+
+            if (
+                position == end ||
+                !position.has_tag(prompt_pasted_tag_)
+            ) {
+                continue;
+            }
+
+            const int start_offset =
+                position.get_offset();
+            auto range_end = position;
+
+            if (!range_end.forward_to_tag_toggle(
+                    prompt_pasted_tag_)) {
+                range_end = end;
+            }
+
+            snapshot.pasted_ranges.emplace_back(
+                start_offset,
+                range_end.get_offset());
+            position = range_end;
+        }
+
+        return snapshot;
+    }
+
+    static bool prompt_snapshots_equal(
+        const PromptEditSnapshot& left,
+        const PromptEditSnapshot& right
+    ) {
+        return
+            left.text == right.text &&
+            left.pasted_ranges == right.pasted_ranges;
+    }
+
+    void trim_prompt_history() {
+        constexpr std::size_t maximum_history = 200;
+
+        if (prompt_undo_history_.size() > maximum_history) {
+            prompt_undo_history_.erase(
+                prompt_undo_history_.begin(),
+                prompt_undo_history_.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        prompt_undo_history_.size() -
+                        maximum_history));
+        }
+    }
+
+    void begin_prompt_history_transaction() {
+        if (prompt_history_transaction_depth_++ == 0) {
+            prompt_history_transaction_start_ =
+                capture_prompt_edit_snapshot();
+        }
+    }
+
+    void end_prompt_history_transaction() {
+        if (prompt_history_transaction_depth_ <= 0) {
+            prompt_history_transaction_depth_ = 0;
+            return;
+        }
+
+        if (--prompt_history_transaction_depth_ != 0) {
+            return;
+        }
+
+        const auto after =
+            capture_prompt_edit_snapshot();
+
+        if (!prompt_snapshots_equal(
+                prompt_history_transaction_start_,
+                after)) {
+            prompt_undo_history_.push_back(
+                prompt_history_transaction_start_);
+            trim_prompt_history();
+            prompt_redo_history_.clear();
+        }
+
+        prompt_history_current_ = after;
+    }
+
+    void restore_prompt_edit_snapshot(
+        const PromptEditSnapshot& snapshot
+    ) {
+        const auto buffer = prompt_.get_buffer();
+
+        if (!buffer) {
+            return;
+        }
+
+        prompt_history_restoring_ = true;
+        buffer->set_text(snapshot.text);
+
+        if (prompt_pasted_tag_) {
+            const int character_count =
+                buffer->get_char_count();
+
+            for (const auto& range :
+                 snapshot.pasted_ranges) {
+                const int start_offset =
+                    std::clamp(
+                        range.first,
+                        0,
+                        character_count);
+                const int end_offset =
+                    std::clamp(
+                        range.second,
+                        start_offset,
+                        character_count);
+                auto start =
+                    buffer->get_iter_at_offset(
+                        start_offset);
+                auto end =
+                    buffer->get_iter_at_offset(
+                        end_offset);
+                buffer->apply_tag(
+                    prompt_pasted_tag_,
+                    start,
+                    end);
+            }
+        }
+
+        const int character_count =
+            buffer->get_char_count();
+        auto insertion = buffer->get_iter_at_offset(
+            std::clamp(
+                snapshot.insert_offset,
+                0,
+                character_count));
+        auto selection_bound =
+            buffer->get_iter_at_offset(
+                std::clamp(
+                    snapshot.selection_bound_offset,
+                    0,
+                    character_count));
+        buffer->select_range(
+            insertion,
+            selection_bound);
+        prompt_history_restoring_ = false;
+        prompt_history_current_ = snapshot;
+        prompt_.scroll_to(buffer->get_insert());
+    }
+
+    void undo_prompt_edit() {
+        if (prompt_undo_history_.empty()) {
+            return;
+        }
+
+        prompt_redo_history_.push_back(
+            capture_prompt_edit_snapshot());
+        const auto snapshot =
+            prompt_undo_history_.back();
+        prompt_undo_history_.pop_back();
+        restore_prompt_edit_snapshot(snapshot);
+    }
+
+    void redo_prompt_edit() {
+        if (prompt_redo_history_.empty()) {
+            return;
+        }
+
+        prompt_undo_history_.push_back(
+            capture_prompt_edit_snapshot());
+        trim_prompt_history();
+        const auto snapshot =
+            prompt_redo_history_.back();
+        prompt_redo_history_.pop_back();
+        restore_prompt_edit_snapshot(snapshot);
+    }
+
+    void reset_prompt_edit_history() {
+        prompt_undo_history_.clear();
+        prompt_redo_history_.clear();
+        prompt_history_transaction_depth_ = 0;
+        prompt_history_current_ =
+            capture_prompt_edit_snapshot();
+    }
+
+    void save_current_composer_draft() {
+        if (composer_thread_id_.empty()) {
+            return;
+        }
+
+        ComposerDraft& draft =
+            composer_drafts_[composer_thread_id_];
+        draft.current =
+            capture_prompt_edit_snapshot();
+        draft.undo_history =
+            prompt_undo_history_;
+        draft.redo_history =
+            prompt_redo_history_;
+        draft.image_paths =
+            attached_image_paths_;
+        draft.audio_paths =
+            attached_audio_paths_;
+        draft.temporary_attachment_paths =
+            queued_temporary_attachment_paths_;
+    }
+
+    void switch_composer_to_thread(
+        const std::string& thread_id
+    ) {
+        if (composer_thread_id_ == thread_id) {
+            return;
+        }
+
+        save_current_composer_draft();
+        composer_thread_id_ = thread_id;
+
+        PromptEditSnapshot current;
+        std::vector<PromptEditSnapshot> undo_history;
+        std::vector<PromptEditSnapshot> redo_history;
+        std::vector<std::string> image_paths;
+        std::vector<std::string> audio_paths;
+        std::vector<std::string> temporary_paths;
+
+        const auto saved =
+            composer_drafts_.find(thread_id);
+
+        if (
+            !thread_id.empty() &&
+            saved != composer_drafts_.end()
+        ) {
+            current = saved->second.current;
+            undo_history =
+                saved->second.undo_history;
+            redo_history =
+                saved->second.redo_history;
+            image_paths =
+                saved->second.image_paths;
+            audio_paths =
+                saved->second.audio_paths;
+            temporary_paths =
+                saved->second
+                    .temporary_attachment_paths;
+        }
+
+        prompt_history_transaction_depth_ = 0;
+        restore_prompt_edit_snapshot(current);
+        prompt_undo_history_ =
+            std::move(undo_history);
+        prompt_redo_history_ =
+            std::move(redo_history);
+        prompt_history_current_ = current;
+        attached_image_paths_ =
+            std::move(image_paths);
+        attached_audio_paths_ =
+            std::move(audio_paths);
+        queued_temporary_attachment_paths_ =
+            std::move(temporary_paths);
+
+        skill_popover_.popdown();
+        refresh_attachment_row();
+        update_prompt_height();
+        update_send_button_state();
+    }
+
+    void discard_composer_draft(
+        const std::string& thread_id
+    ) {
+        if (composer_thread_id_ == thread_id) {
+            switch_composer_to_thread({});
+        }
+
+        const auto draft =
+            composer_drafts_.find(thread_id);
+
+        if (draft == composer_drafts_.end()) {
+            return;
+        }
+
+        remove_temporary_attachment_files(
+            draft->second.temporary_attachment_paths);
+        composer_drafts_.erase(draft);
+    }
+
+    void clear_prompt_after_submission() {
+        record_prompt_history(
+            composer_thread_id_,
+            prompt_.get_buffer()->get_text());
+        prompt_history_restoring_ = true;
+        prompt_.get_buffer()->set_text("");
+        prompt_history_restoring_ = false;
+        reset_prompt_edit_history();
+        prompt_command_history_navigation_[
+            composer_thread_id_] = {};
+    }
+
+    void record_prompt_history(
+        const std::string& thread_id,
+        const Glib::ustring& text
+    ) {
+        if (
+            thread_id.empty() ||
+            trim(text.raw()).empty()
+        ) {
+            return;
+        }
+
+        auto& history =
+            prompt_command_histories_[thread_id];
+
+        if (history.empty() || history.back() != text) {
+            history.push_back(text);
+        }
+
+        constexpr std::size_t maximum_entries = 200;
+        if (history.size() > maximum_entries) {
+            history.erase(
+                history.begin(),
+                history.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        history.size() -
+                        maximum_entries));
+        }
+    }
+
+    void seed_prompt_history_from_thread(
+        const std::string& thread_id,
+        const nlohmann::json& thread
+    ) {
+        if (
+            thread_id.empty() ||
+            prompt_history_seeded_threads_.find(thread_id) !=
+                prompt_history_seeded_threads_.end() ||
+            !thread.is_object() ||
+            !thread.contains("turns") ||
+            !thread["turns"].is_array()
+        ) {
+            return;
+        }
+
+        prompt_history_seeded_threads_.insert(thread_id);
+
+        const auto locally_recorded =
+            prompt_command_histories_[thread_id];
+        prompt_command_histories_[thread_id].clear();
+
+        for (const auto& turn : thread["turns"]) {
+            if (
+                !turn.is_object() ||
+                !turn.contains("items") ||
+                !turn["items"].is_array()
+            ) {
+                continue;
+            }
+
+            for (const auto& item : turn["items"]) {
+                if (
+                    !item.is_object() ||
+                    json_string_field(item, "type") !=
+                        "userMessage" ||
+                    !item.contains("content") ||
+                    !item["content"].is_array()
+                ) {
+                    continue;
+                }
+
+                std::string text;
+                for (const auto& input : item["content"]) {
+                    if (
+                        !input.is_object() ||
+                        json_string_field(input, "type") !=
+                            "text"
+                    ) {
+                        continue;
+                    }
+
+                    const std::string part =
+                        json_string_field(input, "text");
+                    if (part.empty()) {
+                        continue;
+                    }
+
+                    if (!text.empty()) {
+                        text += '\n';
+                    }
+                    text += part;
+                }
+
+                record_prompt_history(
+                    thread_id,
+                    Glib::ustring(text));
+            }
+        }
+
+        for (const auto& local_entry : locally_recorded) {
+            record_prompt_history(
+                thread_id,
+                local_entry);
+        }
+    }
+
+    bool navigate_prompt_history(bool older) {
+        if (composer_thread_id_.empty()) {
+            return false;
+        }
+
+        const auto found =
+            prompt_command_histories_.find(
+                composer_thread_id_);
+        if (
+            found == prompt_command_histories_.end() ||
+            found->second.empty()
+        ) {
+            return false;
+        }
+
+        auto& navigation =
+            prompt_command_history_navigation_[
+                composer_thread_id_];
+        const auto& history = found->second;
+        Glib::ustring replacement;
+
+        if (!navigation.active) {
+            if (!older) {
+                return false;
+            }
+
+            navigation.active = true;
+            navigation.draft =
+                prompt_.get_buffer()->get_text();
+            navigation.index = history.size() - 1;
+            replacement = history[navigation.index];
+        } else if (older) {
+            if (navigation.index > 0) {
+                --navigation.index;
+            }
+            replacement = history[navigation.index];
+        } else if (
+            navigation.index + 1 < history.size()
+        ) {
+            ++navigation.index;
+            replacement = history[navigation.index];
+        } else {
+            replacement = navigation.draft;
+            navigation = {};
+        }
+
+        prompt_history_restoring_ = true;
+        const auto buffer = prompt_.get_buffer();
+        buffer->set_text(replacement);
+        buffer->place_cursor(buffer->end());
+        prompt_history_restoring_ = false;
+        reset_prompt_edit_history();
+        prompt_.scroll_to(buffer->get_insert());
         return true;
     }
 
@@ -6277,9 +8894,12 @@ button.approval-danger-button {
                 selection_start,
                 selection_end)
         ) {
+            begin_prompt_history_transaction();
             buffer->erase(
                 selection_start,
                 selection_end);
+        } else {
+            begin_prompt_history_transaction();
         }
 
         auto insertion =
@@ -6297,6 +8917,7 @@ button.approval-danger-button {
         buffer->place_cursor(after_paste);
         prompt_.scroll_to(
             buffer->get_insert());
+        end_prompt_history_transaction();
         return true;
     }
 
@@ -6339,10 +8960,34 @@ button.approval-danger-button {
             return false;
         }
 
+        const bool control_pressed =
+            (event->state & GDK_CONTROL_MASK) != 0;
+        const guint lower_key =
+            gdk_keyval_to_lower(event->keyval);
+
+        if (
+            control_pressed &&
+            lower_key == GDK_KEY_z
+        ) {
+            if ((event->state & GDK_SHIFT_MASK) != 0) {
+                redo_prompt_edit();
+            } else {
+                undo_prompt_edit();
+            }
+            return true;
+        }
+
+        if (
+            control_pressed &&
+            lower_key == GDK_KEY_y
+        ) {
+            redo_prompt_edit();
+            return true;
+        }
+
         const bool is_control_v =
-            (event->state & GDK_CONTROL_MASK) != 0 &&
-            gdk_keyval_to_lower(event->keyval) ==
-                GDK_KEY_v;
+            control_pressed &&
+            lower_key == GDK_KEY_v;
 
         if (
             is_control_v &&
@@ -6361,6 +9006,54 @@ button.approval-danger-button {
             event->keyval == GDK_KEY_Return ||
             event->keyval == GDK_KEY_KP_Enter;
 
+        const bool plain_navigation_key =
+            !control_pressed &&
+            (event->state & GDK_MOD1_MASK) == 0 &&
+            (event->state & GDK_SUPER_MASK) == 0 &&
+            (event->state & GDK_SHIFT_MASK) == 0;
+
+        if (
+            plain_navigation_key &&
+            (
+                event->keyval == GDK_KEY_Up ||
+                event->keyval == GDK_KEY_KP_Up ||
+                event->keyval == GDK_KEY_Down ||
+                event->keyval == GDK_KEY_KP_Down
+            )
+        ) {
+            const bool older =
+                event->keyval == GDK_KEY_Up ||
+                event->keyval == GDK_KEY_KP_Up;
+            const auto buffer = prompt_.get_buffer();
+            const auto insertion =
+                buffer->get_iter_at_mark(
+                    buffer->get_insert());
+            Gtk::TextBuffer::iterator selection_start;
+            Gtk::TextBuffer::iterator selection_end;
+            const bool has_selection =
+                buffer->get_selection_bounds(
+                    selection_start,
+                    selection_end);
+            const bool navigating_history =
+                prompt_command_history_navigation_[
+                    composer_thread_id_].active;
+            auto display_line_probe = insertion;
+            const bool at_boundary =
+                older
+                    ? !prompt_.backward_display_line(
+                        display_line_probe)
+                    : !prompt_.forward_display_line(
+                        display_line_probe);
+
+            if (
+                !has_selection &&
+                (navigating_history || at_boundary) &&
+                navigate_prompt_history(older)
+            ) {
+                return true;
+            }
+        }
+
         if (!is_enter) {
             return false;
         }
@@ -6377,6 +9070,14 @@ button.approval-danger-button {
     }
 
     bool on_window_key_press(GdkEventKey* event) {
+        if (
+            event != nullptr &&
+            event->keyval == GDK_KEY_F11
+        ) {
+            continue_current_thread();
+            return true;
+        }
+
         if (
             event == nullptr ||
             event->keyval != GDK_KEY_Escape ||
@@ -6894,11 +9595,95 @@ button.approval-danger-button {
         prompt_.grab_focus();
     }
 
-    void choose_local_images() {
+    void handle_composer_file_drop(
+        const Glib::RefPtr<Gdk::DragContext>& context,
+        int,
+        int,
+        const Gtk::SelectionData& selection_data,
+        guint,
+        guint time
+    ) {
+        bool accepted = false;
+        std::size_t added = 0;
+
         if (
-            turn_in_progress_ ||
-            shell_command_in_progress_
+            current_composer_accepts_attachments() &&
+            !current_thread_id_.empty()
         ) {
+            for (const auto& uri : selection_data.get_uris()) {
+                std::string filename;
+
+                try {
+                    filename =
+                        Glib::filename_from_uri(uri);
+                } catch (const Glib::Error&) {
+                    continue;
+                }
+
+                std::error_code error;
+
+                if (
+                    filename.empty() ||
+                    !std::filesystem::is_regular_file(
+                        filename,
+                        error) ||
+                    error ||
+                    gdk_pixbuf_get_file_info(
+                        filename.c_str(),
+                        nullptr,
+                        nullptr) == nullptr
+                ) {
+                    continue;
+                }
+
+                accepted = true;
+
+                if (
+                    std::find(
+                        attached_image_paths_.begin(),
+                        attached_image_paths_.end(),
+                        filename) !=
+                    attached_image_paths_.end()
+                ) {
+                    continue;
+                }
+
+                attached_image_paths_.push_back(
+                    filename);
+                ++added;
+            }
+        }
+
+        if (context) {
+            context->drag_finish(
+                accepted,
+                false,
+                time);
+        }
+
+        if (added > 0) {
+            refresh_attachment_row();
+            update_send_button_state();
+            prompt_.grab_focus();
+            status_label_.set_text(
+                turn_in_progress_
+                    ? "Codex: dropped image queued for the follow-up"
+                    : "Codex: dropped image ready to send");
+
+            std::cout
+                << "PASS: queued "
+                << added
+                << " dropped local image attachment(s)\n";
+        } else if (!accepted) {
+            status_label_.set_text(
+                current_composer_accepts_attachments()
+                    ? "Codex: drop a local image file"
+                    : "Codex: attachments are unavailable right now");
+        }
+    }
+
+    void choose_local_images() {
+        if (!current_composer_accepts_attachments()) {
             return;
         }
 
@@ -6993,10 +9778,7 @@ button.approval-danger-button {
     }
 
     void choose_local_audio() {
-        if (
-            turn_in_progress_ ||
-            shell_command_in_progress_
-        ) {
+        if (!current_composer_accepts_attachments()) {
             return;
         }
 
@@ -7091,6 +9873,38 @@ button.approval-danger-button {
     }
 
     void handle_prompt_changed() {
+        if (!prompt_history_restoring_) {
+            auto navigation =
+                prompt_command_history_navigation_.find(
+                    composer_thread_id_);
+
+            if (
+                navigation !=
+                    prompt_command_history_navigation_.end() &&
+                navigation->second.active
+            ) {
+                navigation->second = {};
+            }
+        }
+
+        if (
+            !prompt_history_restoring_ &&
+            prompt_history_transaction_depth_ == 0
+        ) {
+            const auto current =
+                capture_prompt_edit_snapshot();
+
+            if (!prompt_snapshots_equal(
+                    prompt_history_current_,
+                    current)) {
+                prompt_undo_history_.push_back(
+                    prompt_history_current_);
+                trim_prompt_history();
+                prompt_redo_history_.clear();
+                prompt_history_current_ = current;
+            }
+        }
+
         update_prompt_height();
         update_send_button_state();
         update_skill_suggestions();
@@ -7176,21 +9990,51 @@ button.approval-danger-button {
                 SessionWorkKind::ShellCommand;
     }
 
+    bool current_composer_accepts_attachments() const {
+        if (
+            current_thread_id_.empty() ||
+            current_session_shell_busy()
+        ) {
+            return false;
+        }
+
+        const ThreadTurnSession* session =
+            find_turn_session(current_thread_id_);
+
+        return
+            session == nullptr ||
+            !session->busy ||
+            session->work_kind ==
+                SessionWorkKind::Turn;
+    }
+
     void update_send_button_state() {
         turn_in_progress_ =
             current_session_turn_busy();
         shell_command_in_progress_ =
             current_session_shell_busy();
 
-        attachment_button_.set_sensitive(
-            !turn_in_progress_ &&
-            !shell_command_in_progress_ &&
-            !current_thread_id_.empty());
+        const ThreadTurnSession* current_session =
+            find_turn_session(current_thread_id_);
+        continue_button_.set_sensitive(
+            !current_thread_id_.empty() &&
+            !(
+                current_session != nullptr &&
+                current_session->stop_requested
+            ) &&
+            (
+                current_session == nullptr ||
+                !current_session->busy ||
+                current_session->work_kind ==
+                    SessionWorkKind::Turn
+            ));
 
+        const bool accepts_attachments =
+            current_composer_accepts_attachments();
+        attachment_button_.set_sensitive(
+            accepts_attachments);
         audio_attachment_button_.set_sensitive(
-            !turn_in_progress_ &&
-            !shell_command_in_progress_ &&
-            !current_thread_id_.empty());
+            accepts_attachments);
 
         if (shell_command_in_progress_) {
             send_button_.set_sensitive(false);
@@ -7214,7 +10058,9 @@ button.approval-danger-button {
                     : std::string{};
 
             const bool has_follow_up =
-                !follow_up_text.empty();
+                !follow_up_text.empty() ||
+                !attached_image_paths_.empty() ||
+                !attached_audio_paths_.empty();
 
             send_image_.set_from_icon_name(
                 has_follow_up
@@ -7457,18 +10303,233 @@ button.approval-danger-button {
             sidebar_search_connection_.disconnect();
         }
 
-        if (sidebar_search_.get_text().empty()) {
+        const std::string search_term =
+            trim(sidebar_search_.get_text().raw());
+
+        if (search_term.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(
+                    thread_search_mutex_);
+                ++thread_search_generation_;
+                thread_search_latest_generation_ =
+                    thread_search_generation_;
+                thread_search_has_request_ = false;
+            }
+
+            thread_search_results_.clear();
+            thread_search_result_term_.clear();
+            thread_search_error_.clear();
+            thread_search_loading_ = false;
             schedule_sidebar_refresh();
             return;
         }
 
         sidebar_search_connection_ =
             Glib::signal_timeout().connect(
-                [this]() {
-                    refresh_sidebar_threads();
+                [this, search_term]() {
+                    queue_thread_search(search_term);
                     return false;
                 },
-                250);
+                300);
+    }
+
+    void queue_thread_search(
+        const std::string& search_term
+    ) {
+        if (search_term.empty()) {
+            return;
+        }
+
+        ThreadSearchRequest request;
+        request.search_term = search_term;
+        request.environment =
+            current_codex_process_environment();
+
+        {
+            std::lock_guard<std::mutex> lock(
+                thread_search_mutex_);
+            request.generation =
+                ++thread_search_generation_;
+            thread_search_latest_generation_ =
+                request.generation;
+            thread_search_request_ = request;
+            thread_search_has_request_ = true;
+        }
+
+        thread_search_results_.clear();
+        thread_search_result_term_.clear();
+        thread_search_error_.clear();
+        thread_search_loading_ = true;
+        schedule_sidebar_refresh();
+        thread_search_condition_.notify_one();
+    }
+
+    bool thread_search_is_superseded(
+        std::size_t generation
+    ) {
+        std::lock_guard<std::mutex> lock(
+            thread_search_mutex_);
+        return
+            thread_search_stop_ ||
+            generation !=
+                thread_search_latest_generation_;
+    }
+
+    void run_thread_search_worker() {
+        AppServerClient client;
+        bool client_ready = false;
+
+        while (true) {
+            ThreadSearchRequest request;
+
+            {
+                std::unique_lock<std::mutex> lock(
+                    thread_search_mutex_);
+                thread_search_condition_.wait(
+                    lock,
+                    [this]() {
+                        return
+                            thread_search_stop_ ||
+                            thread_search_has_request_;
+                    });
+
+                if (thread_search_stop_) {
+                    break;
+                }
+
+                request = thread_search_request_;
+                thread_search_has_request_ = false;
+            }
+
+            CompletedThreadSearch completed;
+            completed.generation = request.generation;
+            completed.search_term = request.search_term;
+
+            if (!client_ready) {
+                std::string error;
+
+                if (!client.start(error, request.environment)) {
+                    completed.error =
+                        "Could not start the Codex search service: " +
+                        error;
+                } else {
+                    const auto initialized =
+                        client.initialize(
+                            "threaddeck-search",
+                            "ThreadDeck Search",
+                            "0.1.0");
+
+                    if (!initialized.success) {
+                        completed.error = initialized.error;
+                        client.shutdown();
+                    } else {
+                        client_ready = true;
+                    }
+                }
+            }
+
+            std::string cursor;
+            std::set<std::string> result_ids;
+
+            while (
+                completed.error.empty() &&
+                !thread_search_is_superseded(
+                    request.generation)
+            ) {
+                const auto page =
+                    client.search_threads(
+                        request.search_term,
+                        100,
+                        10000,
+                        cursor);
+
+                if (!page.success) {
+                    completed.error = page.error;
+                    client.shutdown();
+                    client_ready = false;
+                    break;
+                }
+
+                for (const auto& match : page.matches) {
+                    nlohmann::json thread = match["thread"];
+                    const std::string thread_id =
+                        thread.value(
+                            "id",
+                            std::string{});
+
+                    if (
+                        thread_id.empty() ||
+                        !result_ids.insert(thread_id).second
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        match.contains("snippet") &&
+                        match["snippet"].is_string()
+                    ) {
+                        thread["_threaddeckSearchSnippet"] =
+                            match["snippet"];
+                    }
+
+                    completed.threads.push_back(
+                        std::move(thread));
+                }
+
+                if (page.next_cursor.empty()) {
+                    break;
+                }
+
+                cursor = page.next_cursor;
+            }
+
+            if (thread_search_is_superseded(
+                    request.generation)) {
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    thread_search_mutex_);
+                thread_search_completed_.push_back(
+                    std::move(completed));
+            }
+
+            thread_search_dispatcher_.emit();
+        }
+
+        client.shutdown();
+    }
+
+    void handle_thread_search_finished() {
+        std::deque<CompletedThreadSearch> completed;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                thread_search_mutex_);
+            completed.swap(thread_search_completed_);
+        }
+
+        for (auto& result : completed) {
+            if (
+                result.generation !=
+                    thread_search_generation_ ||
+                trim(sidebar_search_.get_text().raw()) !=
+                    result.search_term
+            ) {
+                continue;
+            }
+
+            thread_search_results_ =
+                std::move(result.threads);
+            thread_search_result_term_ =
+                std::move(result.search_term);
+            thread_search_error_ =
+                std::move(result.error);
+            thread_search_loading_ = false;
+        }
+
+        schedule_sidebar_refresh();
     }
 
     static bool valid_sort_id(
@@ -7668,6 +10729,155 @@ button.approval-danger-button {
             });
     }
 
+    bool project_has_threads(
+        const std::string& project_id
+    ) const {
+        for (const auto& assignment :
+             thread_project_assignments_) {
+            if (assignment.second == project_id) {
+                return true;
+            }
+        }
+
+        const std::string cwd =
+            project_cwd(project_id);
+        const auto catalog = thread_catalog_.find(cwd);
+
+        if (catalog != thread_catalog_.end()) {
+            for (const auto& thread : catalog->second) {
+                if (
+                    thread.is_object() &&
+                    thread.contains("id") &&
+                    thread["id"].is_string() &&
+                    thread_belongs_to_project(
+                        thread["id"].get<std::string>(),
+                        project_id,
+                        cwd)
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        for (const auto& session : turn_sessions_) {
+            if (
+                session.second &&
+                project_id_for_thread(
+                    session.first,
+                    session.second->cwd) == project_id
+            ) {
+                return true;
+            }
+        }
+
+        return
+            !current_thread_id_.empty() &&
+            selected_project_id_ == project_id;
+    }
+
+    void request_project_deletion(
+        const std::string& project_id
+    ) {
+        if (project_has_threads(project_id)) {
+            Gtk::MessageDialog dialog(
+                *this,
+                "This project is not empty.",
+                false,
+                Gtk::MESSAGE_INFO,
+                Gtk::BUTTONS_OK,
+                true);
+            dialog.set_secondary_text(
+                "Move or delete every thread before deleting the project.");
+            dialog.run();
+            return;
+        }
+
+        const std::string project_label =
+            display_folder_label(project_id);
+        const std::string cwd =
+            project_cwd(project_id);
+
+        Gtk::MessageDialog confirmation(
+            *this,
+            "Delete empty project ‘" +
+                project_label + "’?",
+            false,
+            Gtk::MESSAGE_QUESTION,
+            Gtk::BUTTONS_NONE,
+            true);
+        confirmation.set_secondary_text(
+            "This removes only the ThreadDeck project entry. The folder on disk will not be changed.");
+        confirmation.add_button(
+            "Cancel",
+            Gtk::RESPONSE_CANCEL);
+        confirmation.add_button(
+            "Delete project",
+            Gtk::RESPONSE_OK);
+
+        if (confirmation.run() != Gtk::RESPONSE_OK) {
+            return;
+        }
+
+        selected_project_folders_.erase(
+            std::remove(
+                selected_project_folders_.begin(),
+                selected_project_folders_.end(),
+                project_id),
+            selected_project_folders_.end());
+        collapsed_project_folders_.erase(project_id);
+        folder_labels_.erase(project_id);
+        project_thread_sorts_.erase(project_id);
+        project_paths_.erase(project_id);
+
+        if (editing_folder_cwd_ == project_id) {
+            editing_folder_cwd_.clear();
+        }
+
+        if (selected_project_id_ == project_id) {
+            current_thread_id_.clear();
+            last_active_thread_id_.clear();
+            last_active_thread_cwd_.clear();
+            clear_active_thread_surfaces();
+
+            if (selected_project_folders_.empty()) {
+                selected_project_id_.clear();
+                selected_folder_path_.clear();
+                selected_folder_.set_text(
+                    "No folder selected");
+            } else {
+                selected_project_id_ =
+                    selected_project_folders_.front();
+                selected_folder_path_ =
+                    project_cwd(selected_project_id_);
+                selected_folder_.set_text(
+                    selected_folder_path_);
+            }
+
+            transcript_.get_buffer()->set_text(
+                "Empty project deleted from ThreadDeck.\n\nChoose a thread or create a new one.");
+        }
+
+        const bool cwd_still_used =
+            std::any_of(
+                selected_project_folders_.begin(),
+                selected_project_folders_.end(),
+                [this, &cwd](const std::string& remaining) {
+                    return project_cwd(remaining) == cwd;
+                });
+
+        if (!cwd_still_used) {
+            thread_catalog_.erase(cwd);
+        }
+
+        new_thread_button_.set_sensitive(
+            app_server_.is_running() &&
+            !selected_folder_path_.empty());
+        status_label_.set_text("Codex: connected");
+        save_ui_state();
+        update_send_button_state();
+        schedule_sidebar_refresh();
+    }
+
     static bool contains_search_text(
         const std::string& value,
         const std::string& query
@@ -7782,6 +10992,8 @@ button.approval-danger-button {
     }
 
     void clear_sidebar_list() {
+        approval_question_rows_.clear();
+
         const auto children =
             sidebar_list_.get_children();
 
@@ -8182,8 +11394,18 @@ button.approval-danger-button {
 
         thread_labels_.erase(thread_id);
         thread_access_selections_.erase(thread_id);
+        thread_model_selections_.erase(thread_id);
         thread_reasoning_selections_.erase(thread_id);
         thread_shield_selections_.erase(thread_id);
+        thread_auto_copy_selections_.erase(thread_id);
+        thread_remote_shield_hosts_.erase(thread_id);
+        thread_observed_remote_hosts_.erase(thread_id);
+        prompt_command_histories_.erase(thread_id);
+        prompt_history_seeded_threads_.erase(thread_id);
+        prompt_command_history_navigation_.erase(
+            thread_id);
+        paused_threads_.erase(thread_id);
+        pause_requested_threads_.erase(thread_id);
         thread_project_assignments_.erase(thread_id);
         moved_thread_summaries_.erase(thread_id);
         thread_configured_approval_policies_.erase(
@@ -8191,6 +11413,7 @@ button.approval-danger-button {
         thread_configured_sandbox_policies_.erase(
             thread_id);
         remove_thread_from_catalog(thread_id);
+        discard_composer_draft(thread_id);
 
         if (editing_thread_id_ == thread_id) {
             editing_thread_id_.clear();
@@ -8499,6 +11722,30 @@ button.approval-danger-button {
             return;
         }
 
+        if (searching) {
+            std::string search_status;
+
+            if (thread_search_loading_) {
+                search_status =
+                    "Searching all thread messages…";
+            } else if (!thread_search_error_.empty()) {
+                search_status =
+                    "Full-text search is unavailable: " +
+                    thread_search_error_;
+            }
+
+            if (!search_status.empty()) {
+                auto* status =
+                    Gtk::manage(
+                        new Gtk::Label(search_status));
+                status->set_xalign(0.0F);
+                status->set_line_wrap(true);
+                sidebar_list_.pack_start(
+                    *status,
+                    Gtk::PACK_SHRINK);
+            }
+        }
+
         if (!searching && app_server_.is_running()) {
             for (const auto& project_id :
                  selected_project_folders_) {
@@ -8670,16 +11917,65 @@ button.approval-danger-button {
             folder_more_button->set_relief(
                 Gtk::RELIEF_NONE);
             folder_more_button->set_tooltip_text(
-                "Edit folder display label");
+                "Project actions");
             folder_more_button->get_style_context()
                 ->add_class(
                     "sidebar-more-button");
 
+            auto* folder_actions =
+                Gtk::manage(new Gtk::Menu());
+            auto* rename_folder_item =
+                Gtk::manage(
+                    new Gtk::MenuItem(
+                        "Rename project"));
+            auto* delete_folder_item =
+                Gtk::manage(
+                    new Gtk::MenuItem(
+                        "Delete project"));
+
+            rename_folder_item
+                ->signal_activate()
+                .connect(
+                    [this, project_id]() {
+                        begin_folder_label_edit(
+                            project_id);
+                    });
+
+            const bool folder_is_empty =
+                !project_has_threads(project_id);
+            delete_folder_item->set_sensitive(
+                folder_is_empty);
+            delete_folder_item->set_tooltip_text(
+                folder_is_empty
+                    ? "Delete this empty ThreadDeck project"
+                    : "Move or delete every thread first");
+            delete_folder_item->get_style_context()
+                ->add_class("destructive-action");
+            delete_folder_item
+                ->signal_activate()
+                .connect(
+                    [this, project_id]() {
+                        request_project_deletion(
+                            project_id);
+                    });
+
+            folder_actions->append(
+                *rename_folder_item);
+            folder_actions->append(
+                *delete_folder_item);
+            folder_actions->attach_to_widget(
+                *folder_more_button);
+            folder_actions->show_all();
+
             folder_more_button
                 ->signal_clicked()
                 .connect(
-                    [this, project_id]() {
-                        begin_folder_label_edit(project_id);
+                    [folder_more_button, folder_actions]() {
+                        folder_actions->popup_at_widget(
+                            folder_more_button,
+                            Gdk::GRAVITY_SOUTH_EAST,
+                            Gdk::GRAVITY_NORTH_EAST,
+                            nullptr);
                     });
 
             folder_row->pack_end(
@@ -8784,66 +12080,60 @@ button.approval-danger-button {
             std::string list_error;
 
             if (searching) {
-                const auto result =
-                    app_server_.list_threads(
-                        cwd,
-                        100,
-                        10000,
-                        search_term,
-                        true);
+                if (
+                    thread_search_result_term_ ==
+                    search_term
+                ) {
+                    threads = thread_search_results_;
+                }
 
-                if (result.success) {
-                    threads = result.threads;
+                std::set<std::string> result_ids;
 
-                    std::set<std::string> result_ids;
+                for (const auto& thread : threads) {
+                    if (
+                        thread.is_object() &&
+                        thread.contains("id") &&
+                        thread["id"].is_string()
+                    ) {
+                        result_ids.insert(
+                            thread["id"]
+                                .get<std::string>());
+                    }
+                }
 
-                    for (const auto& thread : threads) {
+                const auto cached =
+                    thread_catalog_.find(cwd);
+
+                if (cached != thread_catalog_.end()) {
+                    for (const auto& thread : cached->second) {
                         if (
-                            thread.is_object() &&
-                            thread.contains("id") &&
-                            thread["id"].is_string()
+                            !thread.is_object() ||
+                            !thread.contains("id") ||
+                            !thread["id"].is_string()
                         ) {
-                            result_ids.insert(
-                                thread["id"]
-                                    .get<std::string>());
+                            continue;
+                        }
+
+                        const std::string thread_id =
+                            thread["id"].get<std::string>();
+
+                        if (
+                            result_ids.find(thread_id) ==
+                                result_ids.end() &&
+                            (
+                                contains_search_text(
+                                    display_thread_label(
+                                        thread),
+                                    search_term) ||
+                                contains_search_text(
+                                    thread_id,
+                                    search_term)
+                            )
+                        ) {
+                            threads.push_back(thread);
+                            result_ids.insert(thread_id);
                         }
                     }
-
-                    const auto cached =
-                        thread_catalog_.find(cwd);
-
-                    if (cached != thread_catalog_.end()) {
-                        for (const auto& thread : cached->second) {
-                            if (
-                                !thread.is_object() ||
-                                !thread.contains("id") ||
-                                !thread["id"].is_string()
-                            ) {
-                                continue;
-                            }
-
-                            const std::string thread_id =
-                                thread["id"].get<std::string>();
-
-                            if (
-                                result_ids.find(thread_id) ==
-                                    result_ids.end() &&
-                                (
-                                    contains_search_text(
-                                        display_thread_label(
-                                            thread),
-                                        search_term) ||
-                                    contains_search_text(
-                                        thread_id,
-                                        search_term)
-                                )
-                            ) {
-                                threads.push_back(thread);
-                            }
-                        }
-                    }
-                } else {
-                    list_error = result.error;
                 }
             } else {
                 auto cached =
@@ -9006,6 +12296,12 @@ button.approval-danger-button {
 
                 const bool is_busy =
                     thread_is_busy(thread_id);
+                const bool has_question =
+                    thread_has_pending_approval(thread_id);
+                const bool completed_unseen =
+                    !is_busy &&
+                    completed_unseen_threads_.find(thread_id) !=
+                        completed_unseen_threads_.end();
 
                 auto* thread_row =
                     Gtk::manage(
@@ -9091,7 +12387,11 @@ button.approval-danger-button {
                                 new Gtk::Spinner());
 
                         spinner->set_tooltip_text(
-                            "Codex is working in this thread");
+                            has_question
+                                ? "This thread is waiting for your approval"
+                                : "Codex is working in this thread");
+                        spinner->get_style_context()
+                            ->add_class("working-spinner");
                         spinner->start();
 
                         thread_button_content->pack_start(
@@ -9135,8 +12435,33 @@ button.approval-danger-button {
                         0.0F,
                         0.5F);
                     thread_button->set_hexpand(true);
+
+                    std::string thread_tooltip =
+                        thread_id;
+
+                    if (
+                        searching &&
+                        thread.contains(
+                            "_threaddeckSearchSnippet") &&
+                        thread[
+                            "_threaddeckSearchSnippet"
+                        ].is_string()
+                    ) {
+                        const std::string snippet =
+                            single_line_preview(
+                                thread[
+                                    "_threaddeckSearchSnippet"
+                                ].get<std::string>(),
+                                180);
+
+                        if (!snippet.empty()) {
+                            thread_tooltip +=
+                                "\n\nMatch: " + snippet;
+                        }
+                    }
+
                     thread_button->set_tooltip_text(
-                        thread_id);
+                        thread_tooltip);
 
                     thread_button->get_style_context()
                         ->add_class("thread-row");
@@ -9148,6 +12473,39 @@ button.approval-danger-button {
                                 "active-thread");
 
                         current_thread_was_listed = true;
+                    }
+
+                    if (is_busy) {
+                        thread_button
+                            ->get_style_context()
+                            ->add_class(
+                                "working-thread");
+                    }
+
+                    if (has_question) {
+                        thread_button
+                            ->get_style_context()
+                            ->add_class(
+                                "question-thread");
+
+                        if (approval_blink_on_) {
+                            thread_button
+                                ->get_style_context()
+                                ->add_class(
+                                    "question-blink");
+                        }
+
+                        approval_question_rows_.push_back(
+                            thread_button);
+                    }
+
+                    if (completed_unseen) {
+                        thread_button
+                            ->get_style_context()
+                            ->add_class(
+                                "completed-thread");
+                        thread_button->set_tooltip_text(
+                            "Codex finished working in this thread");
                     }
 
                     thread_button
@@ -9331,6 +12689,7 @@ button.approval-danger-button {
             }
 
             if (
+                !searching &&
                 project_id == selected_project_id_ &&
                 !current_thread_id_.empty() &&
                 !current_thread_was_listed
@@ -9353,11 +12712,21 @@ button.approval-danger-button {
 
                 pending_content->set_spacing(6);
 
+                const bool pending_has_question =
+                    thread_has_pending_approval(
+                        current_thread_id_);
+
                 if (thread_is_busy(current_thread_id_)) {
                     auto* spinner =
                         Gtk::manage(
                             new Gtk::Spinner());
 
+                    spinner->set_tooltip_text(
+                        pending_has_question
+                            ? "This thread is waiting for your approval"
+                            : "Codex is working in this thread");
+                    spinner->get_style_context()
+                        ->add_class("working-spinner");
                     spinner->start();
                     pending_content->pack_start(
                         *spinner,
@@ -9403,6 +12772,24 @@ button.approval-danger-button {
                 pending_button->get_style_context()
                     ->add_class("active-thread");
 
+                if (thread_is_busy(current_thread_id_)) {
+                    pending_button->get_style_context()
+                        ->add_class("working-thread");
+                }
+
+                if (pending_has_question) {
+                    pending_button->get_style_context()
+                        ->add_class("question-thread");
+
+                    if (approval_blink_on_) {
+                        pending_button->get_style_context()
+                            ->add_class("question-blink");
+                    }
+
+                    approval_question_rows_.push_back(
+                        pending_button);
+                }
+
                 sidebar_list_.pack_start(
                     *pending_button,
                     Gtk::PACK_SHRINK);
@@ -9410,7 +12797,10 @@ button.approval-danger-button {
                 displayed_thread = true;
             }
 
-            if (!displayed_thread) {
+            if (
+                !displayed_thread &&
+                !(searching && thread_search_loading_)
+            ) {
                 auto* empty_label =
                     Gtk::manage(
                         new Gtk::Label(
@@ -9434,10 +12824,346 @@ button.approval-danger-button {
         }
     }
 
-    static void append_rendered_block(
+    struct CodeCopyPayload {
+        std::string text;
+        std::string language;
+    };
+
+    std::string register_code_copy_payload(
+        const std::string& payload,
+        const std::string& language
+    ) {
+        std::uint64_t hash = 1469598103934665603ULL;
+        const auto hash_text = [&hash](const std::string& text) {
+            for (const unsigned char character : text) {
+                hash ^= character;
+                hash *= 1099511628211ULL;
+            }
+        };
+
+        hash_text(language);
+        hash ^= 0xffU;
+        hash *= 1099511628211ULL;
+        hash_text(payload);
+
+        std::ostringstream identity;
+        identity << std::hex << hash;
+        std::string marker =
+            code_copy_button_marker_prefix() +
+            identity.str() +
+            code_copy_button_marker_suffix();
+
+        const auto existing = code_copy_payloads_.find(marker);
+
+        if (
+            existing != code_copy_payloads_.end() &&
+            (
+                existing->second.text != payload ||
+                existing->second.language != language
+            )
+        ) {
+            marker =
+                code_copy_button_marker_prefix() +
+                identity.str() + "-" +
+                std::to_string(++code_copy_marker_sequence_) +
+                code_copy_button_marker_suffix();
+        }
+
+        code_copy_payloads_[marker] = {
+            payload,
+            language,
+        };
+        return marker;
+    }
+
+    static bool markdown_code_block_payload(
+        const std::string& markdown,
+        std::size_t content_start,
+        const std::string& delimiter,
+        std::string& payload
+    ) {
+        payload.clear();
+        std::size_t line_start = content_start;
+
+        while (line_start <= markdown.size()) {
+            const std::size_t line_end =
+                markdown.find('\n', line_start);
+            const std::string line = markdown.substr(
+                line_start,
+                line_end == std::string::npos
+                    ? std::string::npos
+                    : line_end - line_start);
+
+            if (line.rfind(delimiter, 0) == 0) {
+                std::size_t payload_end = line_start;
+
+                if (
+                    payload_end > content_start &&
+                    markdown[payload_end - 1] == '\n'
+                ) {
+                    --payload_end;
+                }
+
+                payload = markdown.substr(
+                    content_start,
+                    payload_end - content_start);
+                return true;
+            }
+
+            if (line_end == std::string::npos) {
+                break;
+            }
+
+            line_start = line_end + 1;
+        }
+
+        payload.clear();
+        return false;
+    }
+
+    std::string decorate_markdown_code_blocks(
+        const std::string& markdown
+    ) {
+        std::string decorated;
+        bool inside_fence = false;
+        std::size_t line_start = 0;
+
+        while (line_start < markdown.size()) {
+            const std::size_t line_end =
+                markdown.find('\n', line_start);
+            std::string line = markdown.substr(
+                line_start,
+                line_end == std::string::npos
+                    ? std::string::npos
+                    : line_end - line_start);
+
+            const bool fence =
+                line.rfind("```", 0) == 0 ||
+                line.rfind("~~~", 0) == 0;
+
+            if (fence) {
+                const std::string language =
+                    code_fence_language(line);
+
+                if (!language.empty()) {
+                    inside_fence = true;
+
+                    std::string payload;
+                    const std::size_t content_start =
+                        line_end == std::string::npos
+                            ? markdown.size()
+                            : line_end + 1;
+
+                    if (markdown_code_block_payload(
+                            markdown,
+                            content_start,
+                            line.substr(0, 3),
+                            payload)) {
+                        line += "    ";
+                        line += register_code_copy_payload(
+                            payload,
+                            language);
+                    }
+                } else if (inside_fence) {
+                    inside_fence = false;
+                } else {
+                    inside_fence = true;
+                }
+            }
+
+            decorated += line;
+
+            if (line_end == std::string::npos) {
+                break;
+            }
+
+            decorated += '\n';
+            line_start = line_end + 1;
+        }
+
+        return decorated;
+    }
+
+    static std::string unwrap_outer_text_fence(
+        const std::string& markdown,
+        bool allow_incomplete = false
+    ) {
+        std::size_t opening_start = 0;
+
+        while (
+            opening_start < markdown.size() &&
+            (
+                markdown[opening_start] == ' ' ||
+                markdown[opening_start] == '\t' ||
+                markdown[opening_start] == '\r' ||
+                markdown[opening_start] == '\n'
+            )
+        ) {
+            ++opening_start;
+        }
+
+        const bool backtick_fence =
+            markdown.compare(
+                opening_start,
+                7,
+                "```text") == 0;
+        const bool tilde_fence =
+            markdown.compare(
+                opening_start,
+                7,
+                "~~~text") == 0;
+
+        if (!backtick_fence && !tilde_fence) {
+            return markdown;
+        }
+
+        const std::size_t opening_end =
+            markdown.find('\n', opening_start);
+
+        if (opening_end == std::string::npos) {
+            return markdown;
+        }
+
+        std::size_t content_end = markdown.size();
+
+        while (
+            content_end > opening_end + 1 &&
+            (
+                markdown[content_end - 1] == ' ' ||
+                markdown[content_end - 1] == '\t' ||
+                markdown[content_end - 1] == '\r' ||
+                markdown[content_end - 1] == '\n'
+            )
+        ) {
+            --content_end;
+        }
+
+        const std::string delimiter =
+            backtick_fence ? "```" : "~~~";
+
+        if (
+            content_end < 3 ||
+            markdown.compare(
+                content_end - 3,
+                3,
+                delimiter) != 0
+        ) {
+            return
+                allow_incomplete
+                    ? markdown.substr(opening_end + 1)
+                    : markdown;
+        }
+
+        std::size_t closing_start = content_end - 3;
+
+        if (
+            closing_start > opening_end + 1 &&
+            markdown[closing_start - 1] == '\n'
+        ) {
+            --closing_start;
+        }
+
+        return markdown.substr(
+            opening_end + 1,
+            closing_start - (opening_end + 1));
+    }
+
+    static const std::string&
+    code_copy_button_marker_prefix() {
+        static const std::string marker = u8"\ue000";
+        return marker;
+    }
+
+    static const std::string&
+    code_copy_button_marker_suffix() {
+        static const std::string marker = u8"\ue001";
+        return marker;
+    }
+
+    static bool shell_code_language(
+        const std::string& language
+    ) {
+        return
+            language == "bash" ||
+            language == "sh" ||
+            language == "shell" ||
+            language == "zsh" ||
+            language == "console" ||
+            language == "powershell" ||
+            language == "pwsh";
+    }
+
+    static std::string last_shell_code_block(
+        const std::string& markdown
+    ) {
+        std::string last_block;
+        std::string current_block;
+        std::string language;
+        std::string delimiter;
+        bool inside_fence = false;
+        std::size_t line_start = 0;
+
+        while (line_start < markdown.size()) {
+            const std::size_t line_end =
+                markdown.find('\n', line_start);
+            const std::string line = markdown.substr(
+                line_start,
+                line_end == std::string::npos
+                    ? std::string::npos
+                    : line_end - line_start);
+
+            if (!inside_fence) {
+                if (
+                    line.rfind("```", 0) == 0 ||
+                    line.rfind("~~~", 0) == 0
+                ) {
+                    inside_fence = true;
+                    delimiter = line.substr(0, 3);
+                    language = code_fence_language(line);
+                    current_block.clear();
+                }
+            } else if (line.rfind(delimiter, 0) == 0) {
+                if (
+                    shell_code_language(language) &&
+                    !current_block.empty()
+                ) {
+                    if (
+                        !current_block.empty() &&
+                        current_block.back() == '\n'
+                    ) {
+                        current_block.pop_back();
+                    }
+
+                    last_block = current_block;
+                }
+
+                inside_fence = false;
+                delimiter.clear();
+                language.clear();
+                current_block.clear();
+            } else {
+                current_block += line;
+
+                if (line_end != std::string::npos) {
+                    current_block += '\n';
+                }
+            }
+
+            if (line_end == std::string::npos) {
+                break;
+            }
+
+            line_start = line_end + 1;
+        }
+
+        return last_block;
+    }
+
+    void append_rendered_block(
         std::string& transcript,
         const std::string& heading,
-        const std::string& body
+        const std::string& body,
+        bool allow_incomplete_outer_text_fence = false
     ) {
         if (body.empty()) {
             return;
@@ -9449,13 +13175,39 @@ button.approval-danger-button {
 
         transcript += heading;
         transcript += ":\n";
+        const std::string display_body =
+            unwrap_outer_text_fence(
+                body,
+                allow_incomplete_outer_text_fence);
+        transcript +=
+            heading.rfind("Codex", 0) == 0
+                ? decorate_markdown_code_blocks(
+                    display_body)
+                : display_body;
+    }
+
+    static void append_rendered_user_block(
+        std::string& transcript,
+        const std::string& body
+    ) {
+        if (body.empty()) {
+            return;
+        }
+
+        if (!transcript.empty()) {
+            transcript += "\n\n";
+        }
+
+        transcript += "[[THREADDECK_USER_INPUT]]";
         transcript += body;
+        transcript += "[[THREADDECK_USER_INPUT_END]]";
     }
 
     void apply_code_token_tags(
         const Glib::RefPtr<Gtk::TextBuffer>& buffer,
         const Glib::ustring& line,
-        int absolute_line_offset
+        int absolute_line_offset,
+        const std::string& language
     ) {
         const std::string raw = line.raw();
 
@@ -9508,34 +13260,161 @@ button.approval-danger-button {
                 }
             };
 
-        static const std::regex keywords(
+        static const std::regex common_keywords(
             R"(\b(alignas|alignof|and|as|async|auto|await|bool|break|case|catch|char|class|const|constexpr|continue|def|delete|do|double|else|enum|except|export|extends|false|final|finally|float|fn|for|from|function|if|implements|import|in|int|interface|let|long|match|namespace|new|null|nullptr|of|override|package|private|protected|public|raise|return|short|signed|static|std|string|struct|super|switch|this|throw|true|try|type|typedef|typename|union|unsigned|using|var|virtual|void|while|yield)\b)");
+        static const std::regex python_keywords(
+            R"(\b(and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b)");
+        static const std::regex javascript_keywords(
+            R"(\b(as|async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|false|finally|for|from|function|get|if|implements|import|in|instanceof|interface|let|new|null|of|package|private|protected|public|return|set|static|super|switch|this|throw|true|try|typeof|undefined|var|void|while|with|yield)\b)");
+        static const std::regex shell_keywords(
+            R"(\b(case|coproc|do|done|elif|else|esac|fi|for|function|if|in|select|then|time|until|while)\b)");
+        static const std::regex sql_keywords(
+            R"(\b(ALTER|AND|AS|ASC|BEGIN|BETWEEN|BY|CASE|COMMIT|CREATE|DELETE|DESC|DISTINCT|DROP|ELSE|END|EXISTS|FROM|FULL|GROUP|HAVING|IN|INNER|INSERT|INTO|IS|JOIN|LEFT|LIKE|LIMIT|NOT|NULL|ON|OR|ORDER|OUTER|RIGHT|ROLLBACK|SELECT|SET|TABLE|THEN|UNION|UPDATE|VALUES|WHEN|WHERE|WITH|alter|and|as|asc|begin|between|by|case|commit|create|delete|desc|distinct|drop|else|end|exists|from|full|group|having|in|inner|insert|into|is|join|left|like|limit|not|null|on|or|order|outer|right|rollback|select|set|table|then|union|update|values|when|where|with)\b)");
         static const std::regex numbers(
             R"(\b(0x[0-9a-fA-F]+|[0-9]+(?:\.[0-9]+)?)\b)");
         static const std::regex strings(
             R"(("(?:\\.|[^"\\])*")|('(?:\\.|[^'\\])*'))");
-        static const std::regex comments(
-            R"((//.*$|#.*$))");
+        static const std::regex c_comments(
+            R"((//.*$|/\*.*\*/))");
+        static const std::regex hash_comments(
+            R"((#.*$))");
+        static const std::regex sql_comments(
+            R"((--.*$))");
+        const std::regex* keywords = nullptr;
+        const std::regex* comments = nullptr;
+        bool highlight_tokens = false;
 
-        apply_matches(
-            keywords,
-            transcript_code_keyword_tag_);
+        if (
+            language == "python" ||
+            language == "py"
+        ) {
+            highlight_tokens = true;
+            keywords = &python_keywords;
+            comments = &hash_comments;
+        } else if (
+            language == "javascript" ||
+            language == "js" ||
+            language == "typescript" ||
+            language == "ts" ||
+            language == "jsx" ||
+            language == "tsx"
+        ) {
+            highlight_tokens = true;
+            keywords = &javascript_keywords;
+            comments = &c_comments;
+        } else if (
+            language == "bash" ||
+            language == "sh" ||
+            language == "shell" ||
+            language == "zsh"
+        ) {
+            highlight_tokens = true;
+            keywords = &shell_keywords;
+            comments = &hash_comments;
+        } else if (language == "sql") {
+            highlight_tokens = true;
+            keywords = &sql_keywords;
+            comments = &sql_comments;
+        } else if (
+            language == "c" ||
+            language == "cpp" ||
+            language == "c++" ||
+            language == "csharp" ||
+            language == "cs" ||
+            language == "java" ||
+            language == "go" ||
+            language == "rust" ||
+            language == "rs"
+        ) {
+            highlight_tokens = true;
+            keywords = &common_keywords;
+            comments = &c_comments;
+        } else if (
+            language == "ruby" ||
+            language == "rb"
+        ) {
+            highlight_tokens = true;
+            keywords = &common_keywords;
+            comments = &hash_comments;
+        } else if (
+            language == "yaml" ||
+            language == "yml"
+        ) {
+            highlight_tokens = true;
+            comments = &hash_comments;
+        }
+
+        if (!highlight_tokens) {
+            return;
+        }
+
+        if (keywords != nullptr) {
+            apply_matches(
+                *keywords,
+                transcript_code_keyword_tag_);
+        }
         apply_matches(
             numbers,
             transcript_code_number_tag_);
         apply_matches(
             strings,
             transcript_code_string_tag_);
-        apply_matches(
-            comments,
-            transcript_code_comment_tag_);
+        if (comments != nullptr) {
+            apply_matches(
+                *comments,
+                transcript_code_comment_tag_);
+        }
+    }
+
+    static std::string code_fence_language(
+        const std::string& fence
+    ) {
+        if (
+            fence.rfind("```", 0) != 0 &&
+            fence.rfind("~~~", 0) != 0
+        ) {
+            return {};
+        }
+
+        std::string language = fence.substr(3);
+        const auto first =
+            language.find_first_not_of(" \t{.");
+        const auto last =
+            language.find_last_not_of(" \t}");
+
+        if (first == std::string::npos) {
+            return {};
+        }
+
+        language = language.substr(
+            first,
+            last - first + 1);
+
+        const auto token_end =
+            language.find_first_of(" \t");
+
+        if (token_end != std::string::npos) {
+            language.resize(token_end);
+        }
+
+        std::transform(
+            language.begin(),
+            language.end(),
+            language.begin(),
+            [](unsigned char character) {
+                return static_cast<char>(
+                    std::tolower(character));
+            });
+        return language;
     }
 
     void apply_transcript_tags_to_buffer(
         const Glib::RefPtr<Gtk::TextBuffer>& buffer,
         int requested_start_offset,
         bool initial_inside_code_fence = false,
-        bool initial_inside_user_section = false
+        bool initial_inside_user_section = false,
+        bool initial_inside_diff_activity = false,
+        const std::string& initial_code_language = {}
     ) {
         if (!transcript_code_tag_) {
             return;
@@ -9564,7 +13443,21 @@ button.approval-danger-button {
                 transcript_error_tag_,
                 transcript_section_heading_tag_,
                 transcript_user_section_tag_,
+                transcript_user_marker_tag_,
+                transcript_user_top_padding_tag_,
+                transcript_user_bottom_padding_tag_,
+                transcript_expand_activity_tag_,
+                transcript_expand_token_tag_,
                 transcript_code_tag_,
+                transcript_code_header_tag_,
+                transcript_code_copy_tag_,
+                transcript_markdown_marker_tag_,
+                transcript_markdown_heading_tag_,
+                transcript_markdown_bold_tag_,
+                transcript_markdown_inline_code_tag_,
+                transcript_markdown_quote_tag_,
+                transcript_markdown_list_tag_,
+                transcript_markdown_link_tag_,
                 transcript_code_keyword_tag_,
                 transcript_code_string_tag_,
                 transcript_code_comment_tag_,
@@ -9582,17 +13475,65 @@ button.approval-danger-button {
         }
 
         const Glib::ustring text =
-            buffer->get_text(
+            buffer->get_slice(
                 range_start,
                 range_end,
                 true);
 
         bool inside_code_fence =
             initial_inside_code_fence;
+        bool inside_diff_activity =
+            initial_inside_diff_activity;
+        std::string code_language =
+            initial_code_language;
         int user_section_start =
             initial_inside_user_section
                 ? start_offset
                 : -1;
+        constexpr const char* user_marker =
+            "[[THREADDECK_USER_INPUT]]";
+        constexpr const char* user_end_marker =
+            "[[THREADDECK_USER_INPUT_END]]";
+        const int user_marker_length =
+            static_cast<int>(
+                Glib::ustring(user_marker).size());
+
+        const auto apply_user_section =
+            [this, &buffer](
+                int content_start,
+                int content_end
+            ) {
+                if (content_end <= content_start) {
+                    return;
+                }
+
+                auto section_start =
+                    buffer->get_iter_at_offset(
+                        content_start);
+                auto section_end =
+                    buffer->get_iter_at_offset(
+                        content_end);
+                buffer->apply_tag(
+                    transcript_user_section_tag_,
+                    section_start,
+                    section_end);
+
+                auto first_character_end =
+                    section_start;
+                first_character_end.forward_char();
+                buffer->apply_tag(
+                    transcript_user_top_padding_tag_,
+                    section_start,
+                    first_character_end);
+
+                auto last_character_start =
+                    section_end;
+                last_character_start.set_line_offset(0);
+                buffer->apply_tag(
+                    transcript_user_bottom_padding_tag_,
+                    last_character_start,
+                    section_end);
+            };
         Glib::ustring::size_type line_start = 0;
 
         while (line_start <= text.size()) {
@@ -9620,15 +13561,50 @@ button.approval-danger-button {
             auto finish =
                 buffer->get_iter_at_offset(
                     absolute_end);
+            constexpr const char* expand_token_prefix =
+                "[[THREADDECK_EXPAND_";
+            const std::size_t expand_token_position =
+                raw.find(expand_token_prefix);
+            auto visible_line_finish = finish;
+
+            if (
+                expand_token_position !=
+                std::string::npos
+            ) {
+                const int token_character_offset =
+                    static_cast<int>(
+                        Glib::ustring(
+                            raw.substr(
+                                0,
+                                expand_token_position))
+                            .size());
+                auto token_start =
+                    buffer->get_iter_at_offset(
+                        absolute_start +
+                        token_character_offset);
+                visible_line_finish = token_start;
+                buffer->apply_tag(
+                    transcript_expand_token_tag_,
+                    token_start,
+                    finish);
+            }
 
             const bool fence =
                 raw.rfind("```", 0) == 0 ||
                 raw.rfind("~~~", 0) == 0;
+            const std::size_t user_marker_position =
+                raw.find(user_marker);
+            const std::size_t user_end_marker_position =
+                raw.find(user_end_marker);
+            const bool internal_user_marker =
+                user_marker_position == 0;
             const bool user_heading =
                 !inside_code_fence &&
                 (
+                    internal_user_marker ||
                     raw == "You:" ||
-                    raw.rfind("You · ", 0) == 0
+                    raw.rfind("You · ", 0) == 0 ||
+                    raw == "Follow-up:"
                 );
             const bool section_heading =
                 !inside_code_fence &&
@@ -9653,57 +13629,183 @@ button.approval-danger-button {
                 );
 
             if (section_heading) {
-                if (user_section_start >= 0) {
-                    auto user_start =
-                        buffer->get_iter_at_offset(
-                            user_section_start);
+                inside_diff_activity =
+                    raw == "Codex changed files:" ||
+                    raw == "Codex changing files:";
 
-                    buffer->apply_tag(
-                        transcript_user_section_tag_,
-                        user_start,
-                        start);
+                if (user_section_start >= 0) {
+                    apply_user_section(
+                        user_section_start,
+                        absolute_start);
                     user_section_start = -1;
                 }
 
-                if (user_heading) {
+                if (internal_user_marker) {
+                    const int marker_character_offset =
+                        static_cast<int>(
+                            Glib::ustring(
+                                raw.substr(
+                                    0,
+                                    user_marker_position))
+                                .size());
                     user_section_start =
-                        absolute_start;
+                        absolute_start +
+                        marker_character_offset;
+                } else if (user_heading) {
+                    user_section_start = absolute_start;
                 }
 
-                buffer->apply_tag(
-                    transcript_section_heading_tag_,
-                    start,
-                    finish);
+                if (!internal_user_marker) {
+                    buffer->apply_tag(
+                        transcript_section_heading_tag_,
+                        start,
+                        finish);
+                }
             }
 
             if (fence) {
-                buffer->apply_tag(
-                    transcript_code_comment_tag_,
-                    start,
-                    finish);
-                inside_code_fence =
-                    !inside_code_fence;
+                if (inside_code_fence) {
+                    buffer->apply_tag(
+                        transcript_markdown_marker_tag_,
+                        start,
+                        finish);
+                    inside_code_fence = false;
+                    code_language.clear();
+                } else {
+                    buffer->apply_tag(
+                        transcript_code_header_tag_,
+                        start,
+                        finish);
+
+                    auto delimiter_finish = start;
+                    delimiter_finish.forward_chars(
+                        std::min(
+                            3,
+                            absolute_end -
+                                absolute_start));
+                    buffer->apply_tag(
+                        transcript_markdown_marker_tag_,
+                        start,
+                        delimiter_finish);
+
+                    const std::size_t copy_position =
+                        raw.find(
+                            code_copy_button_marker_prefix());
+
+                    if (copy_position != std::string::npos) {
+                        const std::size_t copy_end =
+                            raw.find(
+                                code_copy_button_marker_suffix(),
+                                copy_position +
+                                    code_copy_button_marker_prefix()
+                                        .size());
+
+                        if (copy_end != std::string::npos) {
+                            const std::size_t copy_byte_length =
+                                copy_end +
+                                code_copy_button_marker_suffix()
+                                    .size() -
+                                copy_position;
+                            const int copy_character_offset =
+                                static_cast<int>(
+                                    Glib::ustring(
+                                        raw.substr(
+                                            0,
+                                            copy_position))
+                                        .size());
+                            const int copy_character_length =
+                                static_cast<int>(
+                                    Glib::ustring(
+                                        raw.substr(
+                                            copy_position,
+                                            copy_byte_length))
+                                        .size());
+                            auto copy_start =
+                                buffer->get_iter_at_offset(
+                                    absolute_start +
+                                    copy_character_offset);
+                            auto copy_finish =
+                                buffer->get_iter_at_offset(
+                                    absolute_start +
+                                    copy_character_offset +
+                                    copy_character_length);
+
+                            buffer->apply_tag(
+                                transcript_markdown_marker_tag_,
+                                copy_start,
+                                copy_finish);
+                        }
+                    }
+
+                    inside_code_fence = true;
+                    code_language =
+                        code_fence_language(raw);
+                }
             } else if (inside_code_fence) {
-                buffer->apply_tag(
-                    transcript_code_tag_,
-                    start,
-                    finish);
-                apply_code_token_tags(
-                    buffer,
-                    line,
-                    absolute_start);
+                if (
+                    code_language == "diff" ||
+                    code_language == "patch"
+                ) {
+                    if (
+                        raw.rfind("diff --git ", 0) == 0 ||
+                        raw.rfind("index ", 0) == 0 ||
+                        raw.rfind("@@", 0) == 0 ||
+                        raw.rfind("--- ", 0) == 0 ||
+                        raw.rfind("+++ ", 0) == 0
+                    ) {
+                        buffer->apply_tag(
+                            transcript_diff_header_tag_,
+                            start,
+                            finish);
+                    } else if (
+                        !raw.empty() &&
+                        raw.front() == '+'
+                    ) {
+                        buffer->apply_tag(
+                            transcript_diff_add_tag_,
+                            start,
+                            finish);
+                    } else if (
+                        !raw.empty() &&
+                        raw.front() == '-'
+                    ) {
+                        buffer->apply_tag(
+                            transcript_diff_delete_tag_,
+                            start,
+                            finish);
+                    } else {
+                        buffer->apply_tag(
+                            transcript_code_tag_,
+                            start,
+                            finish);
+                    }
+                } else {
+                    buffer->apply_tag(
+                        transcript_code_tag_,
+                        start,
+                        finish);
+                    apply_code_token_tags(
+                        buffer,
+                        line,
+                        absolute_start,
+                        code_language);
+                }
             } else if (
-                raw.rfind("diff --git ", 0) == 0 ||
-                raw.rfind("index ", 0) == 0 ||
-                raw.rfind("@@", 0) == 0 ||
-                raw.rfind("--- ", 0) == 0 ||
-                raw.rfind("+++ ", 0) == 0
+                inside_diff_activity &&
+                (
+                    raw.rfind("diff --git ", 0) == 0 ||
+                    raw.rfind("index ", 0) == 0 ||
+                    raw.rfind("@@", 0) == 0 ||
+                    raw.rfind("--- ", 0) == 0 ||
+                    raw.rfind("+++ ", 0) == 0
+                )
             ) {
                 buffer->apply_tag(
                     transcript_diff_header_tag_,
                     start,
                     finish);
             } else if (
+                inside_diff_activity &&
                 !raw.empty() &&
                 raw.front() == '+'
             ) {
@@ -9712,6 +13814,7 @@ button.approval-danger-button {
                     start,
                     finish);
             } else if (
+                inside_diff_activity &&
                 !raw.empty() &&
                 raw.front() == '-'
             ) {
@@ -9720,8 +13823,18 @@ button.approval-danger-button {
                     start,
                     finish);
             } else if (
+                internal_user_marker ||
+                (
+                    user_section_start >= 0 &&
+                    user_end_marker_position !=
+                        std::string::npos
+                )
+            ) {
+                // Internal user-block markers are hidden below.
+            } else if (
                 raw == "You:" ||
-                raw.rfind("You · ", 0) == 0
+                raw.rfind("You · ", 0) == 0 ||
+                raw == "Follow-up:"
             ) {
                 buffer->apply_tag(
                     transcript_user_tag_,
@@ -9776,7 +13889,277 @@ button.approval-danger-button {
                     transcript_command_tag_,
                     start,
                     finish);
+            } else if (
+                raw.rfind("… +", 0) == 0 ||
+                raw.rfind(
+                    "… (click to expand full details)",
+                    0) == 0 ||
+                raw.rfind(
+                    "… (click to re-abbreviate)",
+                    0) == 0
+            ) {
+                buffer->apply_tag(
+                    transcript_expand_activity_tag_,
+                    start,
+                    visible_line_finish);
             } else {
+                const auto apply_line_tag =
+                    [&buffer, absolute_start](
+                        const Glib::RefPtr<Gtk::TextTag>& tag,
+                        Glib::ustring::size_type begin,
+                        Glib::ustring::size_type end
+                    ) {
+                        if (end <= begin) {
+                            return;
+                        }
+
+                        auto tagged_start =
+                            buffer->get_iter_at_offset(
+                                absolute_start +
+                                static_cast<int>(begin));
+                        auto tagged_end =
+                            buffer->get_iter_at_offset(
+                                absolute_start +
+                                static_cast<int>(end));
+                        buffer->apply_tag(
+                            tag,
+                            tagged_start,
+                            tagged_end);
+                    };
+
+                Glib::ustring::size_type heading_length = 0;
+
+                while (
+                    heading_length < line.size() &&
+                    heading_length < 6 &&
+                    line[heading_length] == '#'
+                ) {
+                    ++heading_length;
+                }
+
+                if (
+                    heading_length > 0 &&
+                    heading_length < line.size() &&
+                    line[heading_length] == ' '
+                ) {
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        0,
+                        heading_length + 1);
+                    apply_line_tag(
+                        transcript_markdown_heading_tag_,
+                        heading_length + 1,
+                        line.size());
+                }
+
+                Glib::ustring::size_type content_start = 0;
+
+                while (
+                    content_start < line.size() &&
+                    (
+                        line[content_start] == ' ' ||
+                        line[content_start] == '\t'
+                    )
+                ) {
+                    ++content_start;
+                }
+
+                if (
+                    content_start + 1 < line.size() &&
+                    (
+                        line[content_start] == '-' ||
+                        line[content_start] == '*' ||
+                        line[content_start] == '+'
+                    ) &&
+                    line[content_start + 1] == ' '
+                ) {
+                    buffer->apply_tag(
+                        transcript_markdown_list_tag_,
+                        start,
+                        finish);
+                } else if (
+                    content_start + 1 < line.size() &&
+                    line[content_start] == '>' &&
+                    line[content_start + 1] == ' '
+                ) {
+                    buffer->apply_tag(
+                        transcript_markdown_quote_tag_,
+                        start,
+                        finish);
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        content_start,
+                        content_start + 2);
+                }
+
+                Glib::ustring::size_type bold_search = 0;
+
+                while (bold_search < line.size()) {
+                    const auto open =
+                        line.find("**", bold_search);
+
+                    if (open == Glib::ustring::npos) {
+                        break;
+                    }
+
+                    const auto close =
+                        line.find("**", open + 2);
+
+                    if (close == Glib::ustring::npos) {
+                        break;
+                    }
+
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        open,
+                        open + 2);
+                    apply_line_tag(
+                        transcript_markdown_bold_tag_,
+                        open + 2,
+                        close);
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        close,
+                        close + 2);
+                    bold_search = close + 2;
+                }
+
+                const auto character_offset =
+                    [&raw](std::size_t byte_offset) {
+                        return static_cast<
+                            Glib::ustring::size_type>(
+                                Glib::ustring(
+                                    raw.substr(
+                                        0,
+                                        byte_offset))
+                                    .size());
+                    };
+                static const std::regex markdown_link(
+                    R"(\[([^\]]+)\]\((https?://[A-Za-z0-9][^\s\)]*)\))");
+                std::vector<
+                    std::pair<
+                        Glib::ustring::size_type,
+                        Glib::ustring::size_type>>
+                    markdown_url_ranges;
+
+                for (
+                    std::sregex_iterator link(
+                        raw.begin(),
+                        raw.end(),
+                        markdown_link),
+                        end;
+                    link != end;
+                    ++link
+                ) {
+                    const std::size_t full_byte_start =
+                        static_cast<std::size_t>(
+                            link->position());
+                    const std::size_t full_byte_end =
+                        full_byte_start +
+                        static_cast<std::size_t>(
+                            link->length());
+                    const std::size_t label_byte_start =
+                        static_cast<std::size_t>(
+                            (*link).position(1));
+                    const std::size_t label_byte_end =
+                        label_byte_start +
+                        static_cast<std::size_t>(
+                            (*link).length(1));
+                    const std::size_t url_byte_start =
+                        static_cast<std::size_t>(
+                            (*link).position(2));
+                    const std::size_t url_byte_end =
+                        url_byte_start +
+                        static_cast<std::size_t>(
+                            (*link).length(2));
+                    const auto full_start =
+                        character_offset(full_byte_start);
+                    const auto full_end =
+                        character_offset(full_byte_end);
+                    const auto label_start =
+                        character_offset(label_byte_start);
+                    const auto label_end =
+                        character_offset(label_byte_end);
+                    const auto url_start =
+                        character_offset(url_byte_start);
+                    const auto url_end =
+                        character_offset(url_byte_end);
+
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        full_start,
+                        label_start);
+                    apply_line_tag(
+                        transcript_markdown_link_tag_,
+                        label_start,
+                        label_end);
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        label_end,
+                        full_end);
+                    markdown_url_ranges.emplace_back(
+                        url_start,
+                        url_end);
+                }
+
+                static const std::regex bare_link(
+                    R"URL((https?://[A-Za-z0-9][^\s<>()\[\]{}'"`]+))URL");
+
+                for (
+                    std::sregex_iterator link(
+                        raw.begin(),
+                        raw.end(),
+                        bare_link),
+                        end;
+                    link != end;
+                    ++link
+                ) {
+                    std::size_t byte_start =
+                        static_cast<std::size_t>(
+                            link->position());
+                    std::size_t byte_end =
+                        byte_start +
+                        static_cast<std::size_t>(
+                            link->length());
+
+                    while (
+                        byte_end > byte_start &&
+                        (
+                            raw[byte_end - 1] == '.' ||
+                            raw[byte_end - 1] == ',' ||
+                            raw[byte_end - 1] == ';' ||
+                            raw[byte_end - 1] == ':' ||
+                            raw[byte_end - 1] == '!' ||
+                            raw[byte_end - 1] == '?'
+                        )
+                    ) {
+                        --byte_end;
+                    }
+
+                    const auto url_start =
+                        character_offset(byte_start);
+                    const auto url_end =
+                        character_offset(byte_end);
+                    const bool hidden_markdown_url =
+                        std::any_of(
+                            markdown_url_ranges.begin(),
+                            markdown_url_ranges.end(),
+                            [url_start, url_end](
+                                const auto& range
+                            ) {
+                                return
+                                    url_start >= range.first &&
+                                    url_end <= range.second;
+                            });
+
+                    if (!hidden_markdown_url) {
+                        apply_line_tag(
+                            transcript_markdown_link_tag_,
+                            url_start,
+                            url_end);
+                    }
+                }
+
                 Glib::ustring::size_type search = 0;
 
                 while (search < line.size()) {
@@ -9794,21 +14177,83 @@ button.approval-danger-button {
                         break;
                     }
 
-                    auto inline_start =
-                        buffer->get_iter_at_offset(
-                            absolute_start +
-                            static_cast<int>(open));
-                    auto inline_end =
-                        buffer->get_iter_at_offset(
-                            absolute_start +
-                            static_cast<int>(close + 1));
-
-                    buffer->apply_tag(
-                        transcript_code_tag_,
-                        inline_start,
-                        inline_end);
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        open,
+                        open + 1);
+                    apply_line_tag(
+                        transcript_markdown_inline_code_tag_,
+                        open + 1,
+                        close);
+                    apply_line_tag(
+                        transcript_markdown_marker_tag_,
+                        close,
+                        close + 1);
                     search = close + 1;
                 }
+            }
+
+            if (internal_user_marker) {
+                const int marker_character_offset =
+                    static_cast<int>(
+                        Glib::ustring(
+                            raw.substr(
+                                0,
+                                user_marker_position))
+                            .size());
+                auto marker_start =
+                    buffer->get_iter_at_offset(
+                        absolute_start +
+                        marker_character_offset);
+                auto marker_finish =
+                    buffer->get_iter_at_offset(
+                        absolute_start +
+                        marker_character_offset +
+                        user_marker_length);
+                buffer->apply_tag(
+                    transcript_user_marker_tag_,
+                    marker_start,
+                    marker_finish);
+            }
+
+            if (
+                user_section_start >= 0 &&
+                user_end_marker_position != std::string::npos
+            ) {
+                const int end_marker_character_offset =
+                    static_cast<int>(
+                        Glib::ustring(
+                            raw.substr(
+                                0,
+                                user_end_marker_position))
+                            .size());
+                const int end_marker_length =
+                    static_cast<int>(
+                        Glib::ustring(
+                            user_end_marker).size());
+                const int content_end =
+                    absolute_start +
+                    end_marker_character_offset;
+                auto marker_start =
+                    buffer->get_iter_at_offset(
+                        content_end);
+                auto marker_finish =
+                    buffer->get_iter_at_offset(
+                        content_end +
+                        end_marker_length);
+                buffer->apply_tag(
+                    transcript_user_marker_tag_,
+                    marker_start,
+                    marker_finish);
+
+                if (user_section_start >= 0) {
+                    apply_user_section(
+                        user_section_start,
+                        content_end);
+                    user_section_start = -1;
+                }
+
+                inside_code_fence = false;
             }
 
             if (newline == Glib::ustring::npos) {
@@ -9819,32 +14264,42 @@ button.approval-danger-button {
         }
 
         if (user_section_start >= 0) {
-            auto user_start =
-                buffer->get_iter_at_offset(
-                    user_section_start);
-
-            buffer->apply_tag(
-                transcript_user_section_tag_,
-                user_start,
-                range_end);
+            apply_user_section(
+                user_section_start,
+                range_end.get_offset());
         }
+
+        materialize_code_copy_buttons(buffer);
     }
 
     void apply_transcript_tags(
         int requested_start_offset,
         bool initial_inside_code_fence = false,
-        bool initial_inside_user_section = false
+        bool initial_inside_user_section = false,
+        bool initial_inside_diff_activity = false,
+        const std::string& initial_code_language = {}
     ) {
         apply_transcript_tags_to_buffer(
             transcript_.get_buffer(),
             requested_start_offset,
             initial_inside_code_fence,
-            initial_inside_user_section);
+            initial_inside_user_section,
+            initial_inside_diff_activity,
+            initial_code_language);
     }
 
     struct TranscriptImage {
         std::string marker;
         std::string path;
+    };
+
+    struct TranscriptCopyButton {
+        Glib::RefPtr<Gtk::TextBuffer> buffer;
+        Glib::RefPtr<Gtk::TextBuffer::ChildAnchor>
+            anchor;
+        std::string marker;
+        std::unique_ptr<Gtk::Image> image;
+        std::unique_ptr<Gtk::Button> button;
     };
 
     struct IncrementalTranscriptRender {
@@ -9856,6 +14311,8 @@ button.approval-danger-button {
         std::size_t generation{0};
         bool inside_code_fence{false};
         bool inside_user_section{false};
+        bool inside_diff_activity{false};
+        std::string code_language;
     };
 
     std::string render_user_content(
@@ -10453,8 +14910,9 @@ button.approval-danger-button {
             lines.pop_back();
         }
 
+        bool line_was_truncated = false;
         const auto compact_line =
-            [maximum_line_length](
+            [maximum_line_length, &line_was_truncated](
                 const std::string& line
             ) {
                 if (
@@ -10464,6 +14922,7 @@ button.approval-danger-button {
                     return line;
                 }
 
+                line_was_truncated = true;
                 return
                     line.substr(
                         0,
@@ -10495,16 +14954,77 @@ button.approval-danger-button {
             rendered
                 << "… +"
                 << (lines.size() - visible_lines)
-                << " lines";
+                << " lines (click to expand)";
+        } else if (line_was_truncated) {
+            if (visible_lines > 0) {
+                rendered << '\n';
+            }
+
+            rendered
+                << "… (click to expand full details)";
         }
 
         return rendered.str();
     }
 
+    static std::string command_output_for_display(
+        const std::string& output
+    ) {
+        std::ostringstream cleaned;
+        std::size_t start = 0;
+        bool wrote_line = false;
+
+        while (start <= output.size()) {
+            const std::size_t end =
+                output.find('\n', start);
+            const std::string line =
+                output.substr(
+                    start,
+                    end == std::string::npos
+                        ? std::string::npos
+                        : end - start);
+            const bool chromium_registration_noise =
+                line.find(
+                    "google_apis/gcm/engine/registration_request.cc") !=
+                    std::string::npos &&
+                line.find("DEPRECATED_ENDPOINT") !=
+                    std::string::npos;
+            const bool chromium_tensorflow_noise =
+                line.find(
+                    "Created TensorFlow Lite XNNPACK delegate for CPU.") !=
+                    std::string::npos;
+
+            if (
+                !chromium_registration_noise &&
+                !chromium_tensorflow_noise &&
+                (
+                    !line.empty() ||
+                    end != std::string::npos
+                )
+            ) {
+                if (wrote_line) {
+                    cleaned << '\n';
+                }
+
+                cleaned << line;
+                wrote_line = true;
+            }
+
+            if (end == std::string::npos) {
+                break;
+            }
+
+            start = end + 1;
+        }
+
+        return cleaned.str();
+    }
+
     static std::string activity_body(
         const nlohmann::json& item,
         const std::string& turn_status,
-        const std::string& streamed_output = {}
+        const std::string& streamed_output = {},
+        bool expanded = false
     ) {
         const std::string type =
             json_string_field(item, "type");
@@ -10512,12 +15032,19 @@ button.approval-danger-button {
         if (type == "commandExecution") {
             std::string rendered =
                 "$ " +
-                compact_activity_text(
-                    json_display_field(
-                        item,
-                        "command",
-                        "(command pending)"),
-                    3);
+                (
+                    expanded
+                        ? json_display_field(
+                            item,
+                            "command",
+                            "(command pending)")
+                        : compact_activity_text(
+                            json_display_field(
+                                item,
+                                "command",
+                                "(command pending)"),
+                            3)
+                );
 
             const std::string cwd =
                 json_string_field(item, "cwd");
@@ -10537,10 +15064,13 @@ button.approval-danger-button {
                     .get<std::string>();
             }
 
+            output = command_output_for_display(output);
+
             if (!output.empty()) {
                 rendered += '\n';
-                rendered += compact_activity_text(
-                    output);
+                rendered += expanded
+                    ? output
+                    : compact_activity_text(output);
             }
 
             std::string completion;
@@ -10610,8 +15140,9 @@ button.approval-danger-button {
 
                     if (!diff.empty()) {
                         rendered += '\n';
-                        rendered +=
-                            compact_activity_text(
+                        rendered += expanded
+                            ? diff
+                            : compact_activity_text(
                                 diff,
                                 14,
                                 240);
@@ -10711,6 +15242,70 @@ button.approval-danger-button {
         return rendered;
     }
 
+    std::string expandable_activity_text(
+        const std::string& full_text,
+        const std::string& activity_identity
+    ) {
+        std::string normalized_full_text =
+            full_text;
+
+        while (
+            !normalized_full_text.empty() &&
+            normalized_full_text.back() == '\n'
+        ) {
+            normalized_full_text.pop_back();
+        }
+
+        const std::string preview =
+            compact_activity_text(
+                normalized_full_text);
+
+        if (
+            preview == normalized_full_text ||
+            preview.find("click to expand") ==
+                std::string::npos
+        ) {
+            return preview;
+        }
+
+        std::string& token =
+            activity_expansion_tokens_[
+                activity_identity];
+
+        if (token.empty()) {
+            token =
+                "[[THREADDECK_EXPAND_" +
+                std::to_string(
+                    ++activity_expansion_sequence_) +
+                "]]";
+        }
+
+        activity_expansion_payloads_[token] = {
+            activity_identity,
+            preview,
+            normalized_full_text,
+        };
+
+        if (
+            expanded_activity_ids_.find(
+                activity_identity) !=
+            expanded_activity_ids_.end()
+        ) {
+            return
+                normalized_full_text +
+                (
+                    !normalized_full_text.empty() &&
+                    normalized_full_text.back() == '\n'
+                        ? ""
+                        : "\n"
+                ) +
+                "… (click to re-abbreviate)" +
+                token;
+        }
+
+        return preview + token;
+    }
+
     enum class LiveEntryKind {
         AgentMessage,
         Reasoning,
@@ -10727,8 +15322,14 @@ button.approval-danger-button {
         std::string state;
         std::string phase;
         std::string text;
+        std::string displayed_text;
         std::string output;
         nlohmann::json item;
+        std::chrono::steady_clock::time_point
+            reveal_after{};
+        std::chrono::steady_clock::time_point
+            last_delta_at{};
+        bool stream_complete{false};
     };
 
     enum class SessionWorkKind {
@@ -10743,6 +15344,13 @@ button.approval-danger-button {
         std::string entry_id;
         nlohmann::json input =
             nlohmann::json::array();
+    };
+
+    struct PendingApprovalState {
+        AppServerClient::ApprovalRequest request;
+        std::string decision;
+        bool resolved{false};
+        std::condition_variable condition;
     };
 
     struct ThreadTurnSession {
@@ -10846,8 +15454,19 @@ button.approval-danger-button {
             transcript_end_mark_.reset();
         }
 
+        const auto current_buffer =
+            transcript_.get_buffer();
+
+        if (
+            current_buffer &&
+            current_buffer->gobj() != buffer->gobj()
+        ) {
+            dematerialize_code_copy_buttons();
+        }
+
         transcript_scroll_pending_ = false;
         transcript_.set_buffer(buffer);
+        materialize_code_copy_buttons(buffer);
     }
 
     void render_thread_transcript(
@@ -10855,6 +15474,7 @@ button.approval-danger-button {
         const std::string& thread_id
     ) {
         std::string rendered;
+        std::size_t activity_index = 0;
         std::vector<TranscriptImage>
             transcript_images;
 
@@ -10900,9 +15520,8 @@ button.approval-danger-button {
                                 "type");
 
                     if (type == "userMessage") {
-                        append_rendered_block(
+                        append_rendered_user_block(
                             rendered,
-                            "You",
                             render_user_content(
                                 item.value(
                                     "content",
@@ -10984,14 +15603,35 @@ button.approval-danger-button {
                             reasoning);
 
                     } else if (is_activity_type(type)) {
+                        const std::string item_id =
+                            json_string_field(
+                                item,
+                                "id");
+                        const std::string activity_identity =
+                            thread_id + ":" +
+                            (
+                                item_id.empty()
+                                    ? "stored-" +
+                                        std::to_string(
+                                            activity_index)
+                                    : item_id
+                            );
+                        ++activity_index;
+                        const std::string full_activity =
+                            activity_body(
+                                item,
+                                turn_status,
+                                {},
+                                true);
+
                         append_rendered_block(
                             rendered,
                             activity_heading(
                                 item,
                                 turn_status),
-                            activity_body(
-                                item,
-                                turn_status));
+                            expandable_activity_text(
+                                full_activity,
+                                activity_identity));
 
                     } else if (type == "hookPrompt") {
                         std::string fragments;
@@ -11189,7 +15829,9 @@ button.approval-danger-button {
                     job->buffer,
                     character_start,
                     job->inside_code_fence,
-                    job->inside_user_section);
+                    job->inside_user_section,
+                    job->inside_diff_activity,
+                    job->code_language);
 
                 std::size_t line_start = 0;
                 while (line_start < chunk.size()) {
@@ -11206,12 +15848,24 @@ button.approval-danger-button {
                         line.rfind("~~~", 0) == 0;
 
                     if (fence) {
-                        job->inside_code_fence =
-                            !job->inside_code_fence;
+                        if (job->inside_code_fence) {
+                            job->inside_code_fence = false;
+                            job->code_language.clear();
+                        } else {
+                            job->inside_code_fence = true;
+                            job->code_language =
+                                code_fence_language(line);
+                        }
                     } else if (!job->inside_code_fence) {
+                        const bool internal_user_marker =
+                            line.rfind(
+                                "[[THREADDECK_USER_INPUT]]",
+                                0) == 0;
                         const bool user_heading =
+                            internal_user_marker ||
                             line == "You:" ||
-                            line.rfind("You · ", 0) == 0;
+                            line.rfind("You · ", 0) == 0 ||
+                            line == "Follow-up:";
                         const bool section_heading =
                             user_heading ||
                             line == "Codex:" ||
@@ -11234,7 +15888,23 @@ button.approval-danger-button {
                         if (section_heading) {
                             job->inside_user_section =
                                 user_heading;
+                            job->inside_diff_activity =
+                                line ==
+                                    "Codex changed files:" ||
+                                line ==
+                                    "Codex changing files:";
                         }
+                    }
+
+                    if (
+                        job->inside_user_section &&
+                        line.find(
+                            "[[THREADDECK_USER_INPUT_END]]") !=
+                            std::string::npos
+                    ) {
+                        job->inside_user_section = false;
+                        job->inside_code_fence = false;
+                        job->code_language.clear();
                     }
 
                     if (line_end == std::string::npos) {
@@ -11344,6 +16014,7 @@ button.approval-danger-button {
         update_send_button_state();
         save_ui_state();
         schedule_sidebar_refresh();
+        approval_dispatcher_.emit();
     }
 
     void show_cached_thread(
@@ -11494,6 +16165,8 @@ button.approval-danger-button {
             return false;
         }
 
+        completed_unseen_threads_.erase(thread_id);
+
         const std::string activation_project_id =
             expected_project_id.empty()
                 ? project_id_for_thread(
@@ -11554,7 +16227,50 @@ button.approval-danger-button {
         session.base_thread =
             cached_thread_summary(thread_id);
         session.options = current_session_options();
+
+        const auto target_model =
+            thread_model_selections_.find(thread_id);
+        if (
+            target_model !=
+                thread_model_selections_.end() &&
+            !target_model->second.empty()
+        ) {
+            session.options.model =
+                target_model->second;
+        }
+
+        const auto target_access =
+            thread_access_selections_.find(thread_id);
+        const bool target_uses_yolo =
+            target_access !=
+                thread_access_selections_.end() &&
+            target_access->second == "yolo";
+
+        if (target_uses_yolo) {
+            session.options.approval_policy =
+                "never";
+            session.options.sandbox_mode =
+                "danger-full-access";
+            session.options.sandbox_policy = {
+                {"type", "dangerFullAccess"},
+            };
+        } else {
+            session.options.approval_policy =
+                "on-request";
+            session.options.sandbox_mode =
+                "workspace-write";
+            session.options.sandbox_policy = {
+                {"type", "workspaceWrite"},
+            };
+        }
+
         session.options.cwd = expected_cwd;
+        session.options.shield_enabled =
+            shield_enabled_ &&
+            thread_shield_selections_.find(thread_id) !=
+                thread_shield_selections_.end();
+        session.options.remote_shield_hosts =
+            remote_shield_hosts_for_thread(thread_id);
         session.mode = effective_mode_;
         session.loading = true;
         prepare_session_process_environment(session);
@@ -11816,11 +16532,14 @@ button.approval-danger-button {
 
     void initialize_app_server() {
         std::string start_error;
+        AppServerClient::ProcessEnvironment environment =
+            current_codex_process_environment();
+        environment.tablet_accessible = true;
 
         if (
             !app_server_.start(
                 start_error,
-                current_codex_process_environment())
+                environment)
         ) {
             status_label_.set_text("Codex: failed to start");
             std::cerr << "FAIL: " << start_error << '\n';
@@ -12045,10 +16764,11 @@ button.approval-danger-button {
     ) {
         std::vector<TranscriptImage> images;
         const std::string rendered =
-            "You:\n" +
+            "[[THREADDECK_USER_INPUT]]" +
             render_user_content(
                 content,
-                images);
+                images) +
+            "[[THREADDECK_USER_INPUT_END]]";
 
         const auto buffer =
             transcript_.get_buffer();
@@ -12110,6 +16830,65 @@ button.approval-danger-button {
             );
     }
 
+    bool thread_has_pending_approval(
+        const std::string& thread_id
+    ) {
+        std::lock_guard<std::mutex> lock(
+            approval_mutex_);
+
+        return std::any_of(
+            pending_approvals_.begin(),
+            pending_approvals_.end(),
+            [&thread_id](
+                const std::shared_ptr<
+                    PendingApprovalState>& pending
+            ) {
+                return
+                    pending != nullptr &&
+                    !pending->resolved &&
+                    pending->request.thread_id ==
+                        thread_id;
+            });
+    }
+
+    bool update_approval_blink() {
+        bool has_pending = false;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                approval_mutex_);
+
+            has_pending = std::any_of(
+                pending_approvals_.begin(),
+                pending_approvals_.end(),
+                [](const std::shared_ptr<
+                    PendingApprovalState>& pending) {
+                    return
+                        pending != nullptr &&
+                        !pending->resolved;
+                });
+        }
+
+        approval_blink_on_ =
+            has_pending && !approval_blink_on_;
+
+        for (Gtk::Widget* row : approval_question_rows_) {
+            if (row == nullptr) {
+                continue;
+            }
+
+            auto context = row->get_style_context();
+
+            if (approval_blink_on_) {
+                context->add_class("question-blink");
+            } else {
+                context->remove_class("question-blink");
+            }
+        }
+
+        return true;
+    }
+
     void prepare_session_process_environment(
         ThreadTurnSession& session
     ) {
@@ -12120,6 +16899,17 @@ button.approval-danger-button {
             thread_shield_selections_.find(
                 session.thread_id) !=
                 thread_shield_selections_.end();
+        session.options.remote_shield_hosts =
+            remote_shield_hosts_for_thread(
+                session.thread_id);
+        const nlohmann::json remote_hosts =
+            remote_shield_host_map_for_thread(
+                session.thread_id);
+        session.process_environment
+            .remote_shield_hosts_json =
+                remote_hosts.empty()
+                    ? std::string{}
+                    : remote_hosts.dump();
         session.desired_environment_generation =
             codex_environment_generation_;
     }
@@ -12267,9 +17057,538 @@ button.approval-danger-button {
         return item;
     }
 
+    static bool live_stream_text_entry(
+        const LiveTurnEntry& entry
+    ) {
+        return
+            entry.kind == LiveEntryKind::AgentMessage ||
+            entry.kind == LiveEntryKind::Reasoning ||
+            entry.kind == LiveEntryKind::Plan;
+    }
+
+    static bool stream_space(char character) {
+        return
+            character == ' ' ||
+            character == '\t' ||
+            character == '\r' ||
+            character == '\n';
+    }
+
+    static std::string outer_text_fence_delimiter(
+        const std::string& text
+    ) {
+        std::size_t opening = 0;
+
+        while (
+            opening < text.size() &&
+            stream_space(text[opening])
+        ) {
+            ++opening;
+        }
+
+        if (text.compare(opening, 7, "```text") == 0) {
+            return "```";
+        }
+
+        if (text.compare(opening, 7, "~~~text") == 0) {
+            return "~~~";
+        }
+
+        return {};
+    }
+
+    static bool stream_inside_code_fence(
+        const std::string& text,
+        std::size_t position
+    ) {
+        const std::string outer_delimiter =
+            outer_text_fence_delimiter(text);
+        bool skipped_outer_opening = false;
+        bool inside = false;
+        std::size_t line_start = 0;
+
+        while (line_start < position) {
+            const std::size_t line_end =
+                text.find('\n', line_start);
+            const std::size_t content_end =
+                line_end == std::string::npos
+                    ? text.size()
+                    : line_end;
+            const std::string line = text.substr(
+                line_start,
+                content_end - line_start);
+            const bool fence =
+                line.rfind("```", 0) == 0 ||
+                line.rfind("~~~", 0) == 0;
+
+            if (fence) {
+                if (
+                    !skipped_outer_opening &&
+                    !outer_delimiter.empty() &&
+                    (
+                        line.rfind("```text", 0) == 0 ||
+                        line.rfind("~~~text", 0) == 0
+                    )
+                ) {
+                    skipped_outer_opening = true;
+                } else {
+                    inside = !inside;
+                }
+            }
+
+            if (
+                line_end == std::string::npos ||
+                line_end >= position
+            ) {
+                break;
+            }
+
+            line_start = line_end + 1;
+        }
+
+        return inside;
+    }
+
+    static std::size_t complete_stream_line_end(
+        const std::string& text,
+        std::size_t position,
+        std::size_t limit
+    ) {
+        const std::size_t newline =
+            text.find('\n', position);
+
+        if (newline != std::string::npos && newline < limit) {
+            return newline + 1;
+        }
+
+        return limit == text.size()
+            ? limit
+            : position;
+    }
+
+    static std::size_t matching_code_fence_end(
+        const std::string& text,
+        std::size_t opening,
+        std::size_t limit
+    ) {
+        const std::string delimiter =
+            text.substr(opening, 3);
+        const std::size_t opening_line_end =
+            complete_stream_line_end(
+                text,
+                opening,
+                limit);
+
+        if (opening_line_end == opening) {
+            return opening;
+        }
+
+        std::size_t line_start = opening_line_end;
+
+        while (line_start < limit) {
+            const std::size_t line_end =
+                complete_stream_line_end(
+                    text,
+                    line_start,
+                    limit);
+
+            if (line_end == line_start) {
+                return opening;
+            }
+
+            if (text.compare(
+                    line_start,
+                    delimiter.size(),
+                    delimiter) == 0
+            ) {
+                return line_end;
+            }
+
+            line_start = line_end;
+        }
+
+        return opening;
+    }
+
+    static std::size_t next_stream_reveal_boundary(
+        const std::string& text,
+        std::size_t position,
+        std::size_t limit,
+        bool stream_complete
+    ) {
+        if (position >= limit) {
+            return position;
+        }
+
+        const bool line_start =
+            position == 0 ||
+            text[position - 1] == '\n';
+        const std::string outer_delimiter =
+            outer_text_fence_delimiter(text);
+
+        if (
+            line_start &&
+            (
+                text.compare(position, 7, "```text") == 0 ||
+                text.compare(position, 7, "~~~text") == 0
+            )
+        ) {
+            return complete_stream_line_end(
+                text,
+                position,
+                limit);
+        }
+
+        if (
+            line_start &&
+            !outer_delimiter.empty() &&
+            text.compare(
+                position,
+                outer_delimiter.size(),
+                outer_delimiter) == 0 &&
+            position + outer_delimiter.size() <= limit
+        ) {
+            std::size_t after =
+                position + outer_delimiter.size();
+
+            while (
+                after < limit &&
+                (
+                    text[after] == ' ' ||
+                    text[after] == '\t' ||
+                    text[after] == '\r'
+                )
+            ) {
+                ++after;
+            }
+
+            if (
+                after == limit ||
+                (after < limit && text[after] == '\n')
+            ) {
+                return complete_stream_line_end(
+                    text,
+                    position,
+                    limit);
+            }
+        }
+
+        const bool fence_line =
+            line_start &&
+            (
+                text.compare(position, 3, "```") == 0 ||
+                text.compare(position, 3, "~~~") == 0
+            );
+
+        if (fence_line) {
+            const std::size_t fence_end =
+                matching_code_fence_end(
+                    text,
+                    position,
+                    limit);
+
+            if (fence_end != position) {
+                return fence_end;
+            }
+
+            return stream_complete
+                ? complete_stream_line_end(
+                    text,
+                    position,
+                    limit)
+                : position;
+        }
+
+        if (stream_inside_code_fence(text, position)) {
+            return complete_stream_line_end(
+                text,
+                position,
+                limit);
+        }
+
+        const auto complete_delimited =
+            [&text, position, limit](
+                const std::string& opening,
+                const std::string& closing
+            ) {
+                if (
+                    text.compare(
+                        position,
+                        opening.size(),
+                        opening) != 0
+                ) {
+                    return position;
+                }
+
+                const std::size_t close = text.find(
+                    closing,
+                    position + opening.size());
+
+                return
+                    close != std::string::npos &&
+                    close + closing.size() <= limit
+                        ? close + closing.size()
+                        : position;
+            };
+
+        for (const auto& delimiters : {
+                 std::pair<std::string, std::string>{"**", "**"},
+                 std::pair<std::string, std::string>{"__", "__"},
+                 std::pair<std::string, std::string>{"~~", "~~"},
+                 std::pair<std::string, std::string>{"`", "`"},
+             }) {
+            const std::size_t complete =
+                complete_delimited(
+                    delimiters.first,
+                    delimiters.second);
+
+            if (complete != position) {
+                return complete;
+            }
+
+            if (
+                text.compare(
+                    position,
+                    delimiters.first.size(),
+                    delimiters.first) == 0
+            ) {
+                return stream_complete ? limit : position;
+            }
+        }
+
+        if (text[position] == '[') {
+            const std::size_t label_end =
+                text.find("](", position + 1);
+            const std::size_t url_end =
+                label_end == std::string::npos
+                    ? std::string::npos
+                    : text.find(')', label_end + 2);
+
+            if (
+                url_end != std::string::npos &&
+                url_end + 1 <= limit
+            ) {
+                return url_end + 1;
+            }
+
+            return stream_complete ? limit : position;
+        }
+
+        const bool bare_url =
+            text.compare(position, 7, "http://") == 0 ||
+            text.compare(position, 8, "https://") == 0;
+
+        if (bare_url) {
+            std::size_t end = position;
+
+            while (
+                end < limit &&
+                !stream_space(text[end])
+            ) {
+                ++end;
+            }
+
+            if (end < limit || limit == text.size()) {
+                return end;
+            }
+
+            return position;
+        }
+
+        if (stream_space(text[position])) {
+            std::size_t end = position + 1;
+
+            while (
+                end < limit &&
+                stream_space(text[end])
+            ) {
+                ++end;
+            }
+
+            return end;
+        }
+
+        std::size_t end = position;
+
+        while (
+            end < limit &&
+            !stream_space(text[end])
+        ) {
+            ++end;
+        }
+
+        if (end < limit || limit == text.size()) {
+            while (
+                end < limit &&
+                stream_space(text[end])
+            ) {
+                ++end;
+            }
+
+            return end;
+        }
+
+        return position;
+    }
+
+    void schedule_live_text_reveal() {
+        if (live_text_reveal_connection_.connected()) {
+            return;
+        }
+
+        live_text_reveal_connection_ =
+            Glib::signal_timeout().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::reveal_live_text_tick),
+                32);
+    }
+
+    void append_live_text_delta(
+        LiveTurnEntry& entry,
+        const std::string& delta
+    ) {
+        if (delta.empty()) {
+            return;
+        }
+
+        const bool caught_up =
+            entry.displayed_text.size() ==
+                entry.text.size();
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        entry.text += delta;
+        entry.stream_complete = false;
+        entry.last_delta_at = now;
+
+        if (caught_up) {
+            entry.reveal_after =
+                now + std::chrono::milliseconds(110);
+        }
+
+        schedule_live_text_reveal();
+    }
+
+    void complete_live_text_entry(
+        LiveTurnEntry& entry
+    ) {
+        entry.stream_complete = true;
+        entry.last_delta_at =
+            std::chrono::steady_clock::now();
+        schedule_live_text_reveal();
+    }
+
+    bool reveal_live_text_tick() {
+        const auto now =
+            std::chrono::steady_clock::now();
+        constexpr auto quiet_delay =
+            std::chrono::milliseconds(150);
+        std::set<std::string> changed_threads;
+        bool pending = false;
+
+        for (auto& session_entry : turn_sessions_) {
+            ThreadTurnSession& session =
+                *session_entry.second;
+
+            for (LiveTurnEntry& entry : session.live_entries) {
+                if (!live_stream_text_entry(entry)) {
+                    continue;
+                }
+
+                if (
+                    entry.displayed_text.size() >
+                        entry.text.size() ||
+                    entry.text.compare(
+                        0,
+                        entry.displayed_text.size(),
+                        entry.displayed_text) != 0
+                ) {
+                    entry.displayed_text.clear();
+                }
+
+                if (
+                    entry.displayed_text.size() >=
+                    entry.text.size()
+                ) {
+                    continue;
+                }
+
+                pending = true;
+
+                if (now < entry.reveal_after) {
+                    continue;
+                }
+
+                std::size_t reveal_limit =
+                    entry.text.size();
+
+                if (
+                    !entry.stream_complete &&
+                    now - entry.last_delta_at < quiet_delay
+                ) {
+                    const std::size_t newline =
+                        entry.text.rfind('\n');
+
+                    if (
+                        newline == std::string::npos ||
+                        newline + 1 <=
+                            entry.displayed_text.size()
+                    ) {
+                        continue;
+                    }
+
+                    reveal_limit = newline + 1;
+                }
+
+                std::size_t reveal_end =
+                    entry.displayed_text.size();
+                const std::size_t reveal_start = reveal_end;
+                constexpr std::size_t reveal_budget = 72;
+
+                while (
+                    reveal_end < reveal_limit &&
+                    reveal_end - reveal_start < reveal_budget
+                ) {
+                    const std::size_t next =
+                        next_stream_reveal_boundary(
+                            entry.text,
+                            reveal_end,
+                            reveal_limit,
+                            entry.stream_complete);
+
+                    if (next <= reveal_end) {
+                        break;
+                    }
+
+                    reveal_end = next;
+                }
+
+                if (reveal_end > reveal_start) {
+                    entry.displayed_text.assign(
+                        entry.text,
+                        0,
+                        reveal_end);
+                    changed_threads.insert(
+                        session.thread_id);
+                }
+            }
+        }
+
+        for (const std::string& thread_id : changed_threads) {
+            if (auto* session = find_turn_session(thread_id)) {
+                render_live_turn(*session);
+            }
+        }
+
+        return pending;
+    }
+
     struct TranscriptStyleState {
         bool inside_code_fence{false};
         bool inside_user_section{false};
+        bool inside_diff_activity{false};
+        std::string code_language;
     };
 
     static TranscriptStyleState transcript_style_state(
@@ -12293,12 +17612,24 @@ button.approval-danger-button {
                 line.rfind("~~~", 0) == 0;
 
             if (fence) {
-                state.inside_code_fence =
-                    !state.inside_code_fence;
+                if (state.inside_code_fence) {
+                    state.inside_code_fence = false;
+                    state.code_language.clear();
+                } else {
+                    state.inside_code_fence = true;
+                    state.code_language =
+                        code_fence_language(line);
+                }
             } else if (!state.inside_code_fence) {
+                const bool internal_user_marker =
+                    line.rfind(
+                        "[[THREADDECK_USER_INPUT]]",
+                        0) == 0;
                 const bool user_heading =
+                    internal_user_marker ||
                     line == "You:" ||
-                    line.rfind("You · ", 0) == 0;
+                    line.rfind("You · ", 0) == 0 ||
+                    line == "Follow-up:";
                 const bool section_heading =
                     user_heading ||
                     line == "Codex:" ||
@@ -12321,7 +17652,21 @@ button.approval-danger-button {
                 if (section_heading) {
                     state.inside_user_section =
                         user_heading;
+                    state.inside_diff_activity =
+                        line == "Codex changed files:" ||
+                        line == "Codex changing files:";
                 }
+            }
+
+            if (
+                state.inside_user_section &&
+                line.find(
+                    "[[THREADDECK_USER_INPUT_END]]") !=
+                    std::string::npos
+            ) {
+                state.inside_user_section = false;
+                state.inside_code_fence = false;
+                state.code_language.clear();
             }
 
             if (line_end == std::string::npos) {
@@ -12334,6 +17679,802 @@ button.approval-danger-button {
         return state;
     }
 
+    void set_transcript_pointer_cursor(bool clickable) {
+        const auto window =
+            transcript_.get_window(
+                Gtk::TEXT_WINDOW_TEXT);
+
+        if (!window) {
+            return;
+        }
+
+        if (!transcript_arrow_cursor_) {
+            transcript_arrow_cursor_ =
+                Gdk::Cursor::create(
+                    Gdk::LEFT_PTR);
+        }
+
+        if (!transcript_hand_cursor_) {
+            transcript_hand_cursor_ =
+                Gdk::Cursor::create(
+                    Gdk::HAND2);
+        }
+
+        window->set_cursor(
+            clickable
+                ? transcript_hand_cursor_
+                : transcript_arrow_cursor_);
+    }
+
+    void handle_transcript_realized() {
+        set_transcript_pointer_cursor(false);
+    }
+
+    bool handle_transcript_pointer_motion(
+        GdkEventMotion* event
+    ) {
+        if (event == nullptr) {
+            return false;
+        }
+
+        int buffer_x = 0;
+        int buffer_y = 0;
+        transcript_.window_to_buffer_coords(
+            Gtk::TEXT_WINDOW_TEXT,
+            static_cast<int>(event->x),
+            static_cast<int>(event->y),
+            buffer_x,
+            buffer_y);
+
+        Gtk::TextBuffer::iterator hovered;
+        transcript_.get_iter_at_location(
+            hovered,
+            buffer_x,
+            buffer_y);
+
+        const bool clickable =
+            (
+                transcript_expand_activity_tag_ &&
+                hovered.has_tag(
+                    transcript_expand_activity_tag_)
+            ) ||
+            (
+                transcript_markdown_link_tag_ &&
+                hovered.has_tag(
+                    transcript_markdown_link_tag_)
+            ) ||
+            (
+                transcript_code_copy_tag_ &&
+                hovered.has_tag(
+                    transcript_code_copy_tag_)
+            );
+
+        set_transcript_pointer_cursor(clickable);
+        return false;
+    }
+
+    bool handle_transcript_pointer_leave(
+        GdkEventCrossing*
+    ) {
+        set_transcript_pointer_cursor(false);
+        return false;
+    }
+
+    bool handle_markdown_link_event(
+        const Glib::RefPtr<Glib::Object>&,
+        GdkEvent* event,
+        const Gtk::TextIter& clicked
+    ) {
+        if (
+            event == nullptr ||
+            event->type != GDK_BUTTON_RELEASE ||
+            event->button.button != 1
+        ) {
+            return false;
+        }
+
+        const auto buffer = transcript_.get_buffer();
+
+        if (!buffer) {
+            return false;
+        }
+
+        auto line_start = clicked;
+        line_start.set_line_offset(0);
+        auto line_end = line_start;
+        line_end.forward_to_line_end();
+        const std::string raw =
+            buffer->get_slice(
+                line_start,
+                line_end,
+                true).raw();
+        const int clicked_column =
+            clicked.get_line_offset();
+        const auto character_offset =
+            [&raw](std::size_t byte_offset) {
+                return static_cast<int>(
+                    Glib::ustring(
+                        raw.substr(
+                            0,
+                            byte_offset))
+                        .size());
+            };
+        std::string url;
+        static const std::regex markdown_link(
+            R"(\[([^\]]+)\]\((https?://[A-Za-z0-9][^\s\)]*)\))");
+
+        for (
+            std::sregex_iterator link(
+                raw.begin(),
+                raw.end(),
+                markdown_link),
+                end;
+            link != end;
+            ++link
+        ) {
+            const std::size_t label_byte_start =
+                static_cast<std::size_t>(
+                    (*link).position(1));
+            const std::size_t label_byte_end =
+                label_byte_start +
+                static_cast<std::size_t>(
+                    (*link).length(1));
+
+            if (
+                clicked_column >=
+                    character_offset(label_byte_start) &&
+                clicked_column <=
+                    character_offset(label_byte_end)
+            ) {
+                url = (*link).str(2);
+                break;
+            }
+        }
+
+        if (url.empty()) {
+            static const std::regex bare_link(
+                R"URL((https?://[A-Za-z0-9][^\s<>()\[\]{}'"`]+))URL");
+
+            for (
+                std::sregex_iterator link(
+                    raw.begin(),
+                    raw.end(),
+                    bare_link),
+                    end;
+                link != end;
+                ++link
+            ) {
+                const std::size_t byte_start =
+                    static_cast<std::size_t>(
+                        link->position());
+                std::size_t byte_end =
+                    byte_start +
+                    static_cast<std::size_t>(
+                        link->length());
+
+                while (
+                    byte_end > byte_start &&
+                    (
+                        raw[byte_end - 1] == '.' ||
+                        raw[byte_end - 1] == ',' ||
+                        raw[byte_end - 1] == ';' ||
+                        raw[byte_end - 1] == ':' ||
+                        raw[byte_end - 1] == '!' ||
+                        raw[byte_end - 1] == '?'
+                    )
+                ) {
+                    --byte_end;
+                }
+
+                if (
+                    clicked_column >=
+                        character_offset(byte_start) &&
+                    clicked_column <=
+                        character_offset(byte_end)
+                ) {
+                    url = raw.substr(
+                        byte_start,
+                        byte_end - byte_start);
+                    break;
+                }
+            }
+        }
+
+        if (url.empty()) {
+            return false;
+        }
+
+        try {
+            Gio::AppInfo::launch_default_for_uri(url);
+            status_label_.set_text(
+                "Codex: opened link in default browser");
+        } catch (const Glib::Error& error) {
+            status_label_.set_text(
+                "Codex: could not open web link");
+            std::cerr
+                << "WARN: could not open transcript link: "
+                << error.what()
+                << '\n';
+        }
+
+        return true;
+    }
+
+    bool copy_text_to_clipboard(
+        const std::string& text
+    ) {
+        if (text.empty()) {
+            return false;
+        }
+
+        const auto clipboard =
+            Gtk::Clipboard::get();
+
+        if (!clipboard) {
+            return false;
+        }
+
+        clipboard->set_text(text);
+        clipboard->store();
+        return true;
+    }
+
+    void prune_code_copy_buttons() {
+        auto button = transcript_copy_buttons_.begin();
+
+        while (button != transcript_copy_buttons_.end()) {
+            if (
+                button->anchor &&
+                !button->anchor->get_deleted()
+            ) {
+                ++button;
+                continue;
+            }
+
+            if (
+                button->button &&
+                button->button->get_parent() ==
+                    &transcript_
+            ) {
+                transcript_.remove(
+                    *button->button);
+            }
+
+            button = transcript_copy_buttons_.erase(
+                button);
+        }
+    }
+
+    void materialize_code_copy_buttons(
+        const Glib::RefPtr<Gtk::TextBuffer>& buffer
+    ) {
+        if (!buffer) {
+            return;
+        }
+
+        const auto visible_buffer =
+            transcript_.get_buffer();
+
+        if (
+            !visible_buffer ||
+            visible_buffer->gobj() != buffer->gobj()
+        ) {
+            return;
+        }
+
+        prune_code_copy_buttons();
+
+        const Glib::ustring contents =
+            buffer->get_slice(
+                buffer->begin(),
+                buffer->end(),
+                true);
+        const Glib::ustring marker_prefix =
+            code_copy_button_marker_prefix();
+        const Glib::ustring marker_suffix =
+            code_copy_button_marker_suffix();
+        std::vector<std::pair<int, std::string>> markers;
+        Glib::ustring::size_type search_offset = 0;
+
+        while (search_offset < contents.size()) {
+            const auto marker_start =
+                contents.find(marker_prefix, search_offset);
+
+            if (marker_start == Glib::ustring::npos) {
+                break;
+            }
+
+            const auto marker_suffix_start =
+                contents.find(
+                    marker_suffix,
+                    marker_start + marker_prefix.size());
+
+            if (marker_suffix_start == Glib::ustring::npos) {
+                break;
+            }
+
+            const auto marker_end =
+                marker_suffix_start + marker_suffix.size();
+            markers.emplace_back(
+                static_cast<int>(marker_start),
+                contents.substr(
+                    marker_start,
+                    marker_end - marker_start).raw());
+            search_offset = marker_end;
+        }
+
+        for (
+            auto marker = markers.rbegin();
+            marker != markers.rend();
+            ++marker
+        ) {
+            const int offset = marker->first;
+            const auto payload =
+                code_copy_payloads_.find(marker->second);
+
+            if (payload == code_copy_payloads_.end()) {
+                continue;
+            }
+
+            auto marker_start =
+                buffer->get_iter_at_offset(offset);
+            auto marker_end = marker_start;
+            marker_end.forward_chars(
+                static_cast<int>(
+                    Glib::ustring(marker->second).size()));
+            buffer->erase(marker_start, marker_end);
+
+            auto insertion =
+                buffer->get_iter_at_offset(offset);
+            TranscriptCopyButton embedded;
+            embedded.buffer = buffer;
+            embedded.marker = marker->second;
+            embedded.anchor =
+                buffer->create_child_anchor(insertion);
+            embedded.image =
+                std::make_unique<Gtk::Image>();
+            embedded.button =
+                std::make_unique<Gtk::Button>();
+
+            embedded.image->set_from_icon_name(
+                "edit-copy-symbolic",
+                Gtk::ICON_SIZE_BUTTON);
+            embedded.button->set_image(
+                *embedded.image);
+            embedded.button->set_always_show_image(true);
+            embedded.button->set_relief(
+                Gtk::RELIEF_NONE);
+            embedded.button->set_focus_on_click(false);
+            embedded.button->set_size_request(36, 36);
+            embedded.button->set_tooltip_text(
+                "Copy code block");
+            embedded.button->get_style_context()
+                ->add_class("compact-header-button");
+            embedded.button->get_style_context()
+                ->add_class("code-copy-button");
+
+            Gtk::Button* const copy_button =
+                embedded.button.get();
+            copy_button->add_events(
+                Gdk::ENTER_NOTIFY_MASK |
+                Gdk::LEAVE_NOTIFY_MASK);
+            copy_button->signal_enter_notify_event()
+                .connect(
+                    [this](GdkEventCrossing*) {
+                        set_transcript_pointer_cursor(true);
+                        return false;
+                    });
+            copy_button->signal_leave_notify_event()
+                .connect(
+                    [this](GdkEventCrossing*) {
+                        set_transcript_pointer_cursor(false);
+                        return false;
+                    });
+
+            embedded.button->signal_clicked().connect(
+                [
+                    this,
+                    copied_text = payload->second.text,
+                    language = payload->second.language
+                ]() {
+                    if (!copy_text_to_clipboard(copied_text)) {
+                        status_label_.set_text(
+                            "Codex: could not copy code block");
+                        return;
+                    }
+
+                    status_label_.set_text(
+                        "Codex: " + language +
+                        " block copied");
+                });
+
+            transcript_.add_child_at_anchor(
+                *embedded.button,
+                embedded.anchor);
+            embedded.button->show_all();
+            transcript_copy_buttons_.push_back(
+                std::move(embedded));
+        }
+    }
+
+    void dematerialize_code_copy_buttons() {
+        for (auto& embedded : transcript_copy_buttons_) {
+            if (
+                !embedded.buffer ||
+                !embedded.anchor ||
+                embedded.anchor->get_deleted()
+            ) {
+                continue;
+            }
+
+            const int offset =
+                embedded.buffer
+                    ->get_iter_at_child_anchor(
+                        embedded.anchor)
+                    .get_offset();
+
+            if (
+                embedded.button &&
+                embedded.button->get_parent() ==
+                    &transcript_
+            ) {
+                transcript_.remove(
+                    *embedded.button);
+            }
+
+            auto anchor_start =
+                embedded.buffer->get_iter_at_offset(
+                    offset);
+            auto anchor_end = anchor_start;
+            anchor_end.forward_char();
+            embedded.buffer->erase(
+                anchor_start,
+                anchor_end);
+            auto insertion =
+                embedded.buffer->get_iter_at_offset(
+                    offset);
+            embedded.buffer->insert(
+                insertion,
+                embedded.marker);
+        }
+
+        transcript_copy_buttons_.clear();
+    }
+
+    bool copy_code_block_at(
+        const Glib::RefPtr<Gtk::TextBuffer>& buffer,
+        const Gtk::TextIter& clicked
+    ) {
+        if (!buffer) {
+            return false;
+        }
+
+        auto opening_start = clicked;
+        opening_start.set_line_offset(0);
+        auto opening_end = opening_start;
+        opening_end.forward_to_line_end();
+
+        const std::string opening =
+            buffer->get_text(
+                opening_start,
+                opening_end,
+                true).raw();
+
+        if (
+            opening.rfind("```", 0) != 0 &&
+            opening.rfind("~~~", 0) != 0
+        ) {
+            return false;
+        }
+
+        const std::string delimiter =
+            opening.substr(0, 3);
+        const std::string language =
+            code_fence_language(opening);
+        std::string copied_text;
+        auto scan = opening_start;
+
+        if (!scan.forward_line()) {
+            return false;
+        }
+
+        while (scan != buffer->end()) {
+            auto line_end = scan;
+            line_end.forward_to_line_end();
+            const std::string line =
+                buffer->get_text(
+                    scan,
+                    line_end,
+                    true).raw();
+
+            if (line.rfind(delimiter, 0) == 0) {
+                break;
+            }
+
+            if (!copied_text.empty()) {
+                copied_text += '\n';
+            }
+
+            copied_text += line;
+
+            if (!scan.forward_line()) {
+                break;
+            }
+        }
+
+        if (!copy_text_to_clipboard(copied_text)) {
+            status_label_.set_text(
+                "Codex: could not copy code block");
+            return true;
+        }
+
+        status_label_.set_text(
+            language.empty()
+                ? "Codex: code block copied"
+                : "Codex: " + language +
+                    " block copied");
+        return true;
+    }
+
+    bool handle_code_copy_event(
+        const Glib::RefPtr<Glib::Object>&,
+        GdkEvent* event,
+        const Gtk::TextIter& clicked
+    ) {
+        if (
+            event == nullptr ||
+            event->type != GDK_BUTTON_RELEASE ||
+            event->button.button != 1
+        ) {
+            return false;
+        }
+
+        return copy_code_block_at(
+            transcript_.get_buffer(),
+            clicked);
+    }
+
+    bool handle_activity_expand_event(
+        const Glib::RefPtr<Glib::Object>&,
+        GdkEvent* event,
+        const Gtk::TextIter& clicked
+    ) {
+        if (
+            event == nullptr ||
+            event->type != GDK_BUTTON_RELEASE ||
+            event->button.button != 1
+        ) {
+            return false;
+        }
+
+        const auto buffer = transcript_.get_buffer();
+
+        if (!buffer) {
+            return false;
+        }
+
+        auto marker_start = clicked;
+        marker_start.set_line_offset(0);
+        auto marker_end = marker_start;
+        marker_end.forward_to_line_end();
+
+        const std::string marker_line =
+            buffer->get_text(
+                marker_start,
+                marker_end,
+                true).raw();
+        constexpr const char* token_prefix =
+            "[[THREADDECK_EXPAND_";
+        const std::size_t token_start =
+            marker_line.find(token_prefix);
+
+        if (token_start == std::string::npos) {
+            return false;
+        }
+
+        const std::size_t token_end =
+            marker_line.find("]]", token_start);
+
+        if (token_end == std::string::npos) {
+            return false;
+        }
+
+        const std::string token =
+            marker_line.substr(
+                token_start,
+                token_end + 2 - token_start);
+
+        Glib::signal_idle().connect(
+            [this, buffer, token]() {
+                toggle_activity_expansion(
+                    buffer,
+                    token);
+                return false;
+            });
+
+        return true;
+    }
+
+    void toggle_activity_expansion(
+        const Glib::RefPtr<Gtk::TextBuffer>& buffer,
+        const std::string& token
+    ) {
+        if (!buffer) {
+            return;
+        }
+
+        const auto payload =
+            activity_expansion_payloads_.find(token);
+
+        if (payload == activity_expansion_payloads_.end()) {
+            return;
+        }
+
+        const Glib::ustring buffer_text =
+            buffer->get_text();
+        const auto token_position =
+            buffer_text.find(
+                Glib::ustring(token));
+
+        if (token_position == Glib::ustring::npos) {
+            return;
+        }
+
+        auto marker_start =
+            buffer->get_iter_at_offset(
+                static_cast<int>(token_position));
+        marker_start.set_line_offset(0);
+        auto marker_end = marker_start;
+        marker_end.forward_to_line_end();
+
+        auto body_start = marker_start;
+        auto scan = marker_start;
+        bool found_heading = false;
+
+        while (scan.get_line() > 0) {
+            if (!scan.backward_line()) {
+                break;
+            }
+
+            if (!scan.has_tag(transcript_activity_tag_)) {
+                continue;
+            }
+
+            auto heading_end = scan;
+            heading_end.forward_to_line_end();
+
+            if (heading_end != buffer->end()) {
+                heading_end.forward_char();
+            }
+
+            body_start = heading_end;
+            found_heading = true;
+            break;
+        }
+
+        if (!found_heading) {
+            return;
+        }
+
+        const int insertion_offset =
+            body_start.get_offset();
+        const bool visible_buffer =
+            transcript_.get_buffer() == buffer;
+        const auto adjustment =
+            visible_buffer
+                ? transcript_scroll_.get_vadjustment()
+                : Glib::RefPtr<Gtk::Adjustment>{};
+        const double previous_scroll =
+            adjustment
+                ? adjustment->get_value()
+                : 0.0;
+        const std::string activity_identity =
+            payload->second.activity_identity;
+        const std::string full_text =
+            payload->second.full_text;
+        const std::string displayed_text =
+            buffer->get_text(
+                body_start,
+                marker_end,
+                true).raw();
+        const bool is_expanded =
+            expanded_activity_ids_.find(
+                activity_identity) !=
+            expanded_activity_ids_.end();
+
+        if (visible_buffer) {
+            transcript_follow_output_ = false;
+        }
+
+        if (is_expanded) {
+            expanded_activity_ids_.erase(
+                activity_identity);
+        } else {
+            expanded_activity_ids_.insert(
+                activity_identity);
+        }
+
+        const std::string replacement_text =
+            expandable_activity_text(
+                full_text,
+                activity_identity);
+
+        buffer->erase(body_start, marker_end);
+
+        auto insertion =
+            buffer->get_iter_at_offset(
+                insertion_offset);
+        buffer->insert(
+            insertion,
+            Glib::ustring(replacement_text));
+
+        const std::string transcript_prefix =
+            buffer->get_text(
+                buffer->begin(),
+                buffer->get_iter_at_offset(
+                    insertion_offset),
+                true).raw();
+        const TranscriptStyleState style_state =
+            transcript_style_state(
+                transcript_prefix);
+        apply_transcript_tags_to_buffer(
+            buffer,
+            insertion_offset,
+            style_state.inside_code_fence,
+            style_state.inside_user_section,
+            style_state.inside_diff_activity,
+            style_state.code_language);
+
+        ThreadTurnSession* session = nullptr;
+
+        for (auto& entry : turn_sessions_) {
+            if (
+                entry.second != nullptr &&
+                entry.second->transcript_buffer == buffer
+            ) {
+                session = entry.second.get();
+                break;
+            }
+        }
+
+        if (
+            session != nullptr &&
+            session->transcript_buffer == buffer
+        ) {
+            const std::size_t rendered_position =
+                session->rendered_tail.find(
+                    displayed_text);
+
+            if (rendered_position != std::string::npos) {
+                session->rendered_tail.replace(
+                    rendered_position,
+                    displayed_text.size(),
+                    replacement_text);
+            }
+        }
+
+        if (visible_buffer) {
+            refresh_transcript_bottom_button();
+        }
+
+        if (adjustment) {
+            Glib::signal_idle().connect(
+                [adjustment, previous_scroll]() {
+                    adjustment->set_value(
+                        std::clamp(
+                            previous_scroll,
+                            adjustment->get_lower(),
+                            std::max(
+                                adjustment->get_lower(),
+                                adjustment->get_upper() -
+                                    adjustment->get_page_size())));
+                    return false;
+                });
+        }
+
+        return;
+    }
+
     void render_live_turn(
         ThreadTurnSession& session
     ) {
@@ -12342,16 +18483,26 @@ button.approval-danger-button {
         }
 
         std::string rendered;
+        std::size_t activity_index = 0;
 
         for (
             const LiveTurnEntry& entry :
             session.live_entries
         ) {
+            if (
+                live_stream_text_entry(entry) &&
+                !entry.text.empty() &&
+                entry.displayed_text.empty()
+            ) {
+                break;
+            }
+
             if (entry.kind == LiveEntryKind::Reasoning) {
                 append_rendered_block(
                     rendered,
                     "Codex reasoning",
-                    entry.text);
+                    entry.displayed_text,
+                    !entry.stream_complete);
                 continue;
             }
 
@@ -12361,7 +18512,8 @@ button.approval-danger-button {
                     entry.phase == "commentary"
                         ? "Codex commentary"
                         : "Codex",
-                    entry.text);
+                    entry.displayed_text,
+                    !entry.stream_complete);
                 continue;
             }
 
@@ -12369,18 +18521,17 @@ button.approval-danger-button {
                 append_rendered_block(
                     rendered,
                     "Codex plan",
-                    entry.text);
+                    entry.displayed_text,
+                    !entry.stream_complete);
                 continue;
             }
 
 
             if (entry.kind == LiveEntryKind::FollowUp) {
                 std::string heading =
-                    "You · follow-up";
+                    "Follow-up";
 
-                if (entry.state == "queued") {
-                    heading += " queued";
-                } else if (entry.state == "rejected") {
+                if (entry.state == "rejected") {
                     heading = "Follow-up rejected";
                 }
 
@@ -12403,17 +18554,32 @@ button.approval-danger-button {
 
             const nlohmann::json item =
                 live_activity_item(entry);
+            const std::string activity_identity =
+                session.thread_id + ":" +
+                (
+                    entry.item_id.empty()
+                        ? "live-" +
+                            std::to_string(
+                                activity_index)
+                        : entry.item_id
+                );
+            ++activity_index;
+
+            const std::string full_activity =
+                activity_body(
+                    item,
+                    entry.state,
+                    entry.output,
+                    true);
 
             append_rendered_block(
                 rendered,
                 activity_heading(
                     item,
                     entry.state),
-                compact_activity_text(
-                    activity_body(
-                        item,
-                        entry.state,
-                        entry.output)));
+                expandable_activity_text(
+                    full_activity,
+                    activity_identity));
         }
 
         if (
@@ -12425,6 +18591,17 @@ button.approval-danger-button {
 
         const auto buffer =
             session.transcript_buffer;
+        const bool preserve_visible_scroll =
+            session.thread_id == current_thread_id_ &&
+            !transcript_follow_output_;
+        const auto visible_adjustment =
+            preserve_visible_scroll
+                ? transcript_scroll_.get_vadjustment()
+                : Glib::RefPtr<Gtk::Adjustment>{};
+        const double previous_scroll =
+            visible_adjustment
+                ? visible_adjustment->get_value()
+                : 0.0;
 
         const bool append_only =
             rendered.size() >=
@@ -12498,11 +18675,28 @@ button.approval-danger-button {
                 buffer,
                 style_start,
                 style_state.inside_code_fence,
-                style_state.inside_user_section);
+                style_state.inside_user_section,
+                style_state.inside_diff_activity,
+                style_state.code_language);
         }
 
         if (session.thread_id == current_thread_id_) {
             scroll_transcript_to_end();
+
+            if (visible_adjustment && !append_only) {
+                Glib::signal_idle().connect(
+                    [visible_adjustment, previous_scroll]() {
+                        visible_adjustment->set_value(
+                            std::clamp(
+                                previous_scroll,
+                                visible_adjustment->get_lower(),
+                                std::max(
+                                    visible_adjustment->get_lower(),
+                                    visible_adjustment->get_upper() -
+                                        visible_adjustment->get_page_size())));
+                        return false;
+                    });
+            }
         }
     }
 
@@ -12568,25 +18762,18 @@ button.approval-danger-button {
     std::string request_approval(
         const AppServerClient::ApprovalRequest& request
     ) {
+        auto pending =
+            std::make_shared<PendingApprovalState>();
+        pending->request = request;
+
         std::unique_lock<std::mutex> lock(
             approval_mutex_);
-
-        approval_condition_.wait(
-            lock,
-            [this]() {
-                return
-                    !approval_waiting_ ||
-                    shutting_down_;
-            });
 
         if (shutting_down_) {
             return "cancel";
         }
 
-        pending_approval_ = request;
-        approval_decision_.clear();
-        approval_waiting_ = true;
-        approval_resolved_ = false;
+        pending_approvals_.push_back(pending);
 
         lock.unlock();
 
@@ -12594,25 +18781,23 @@ button.approval-danger-button {
 
         lock.lock();
 
-        approval_condition_.wait(
+        pending->condition.wait(
             lock,
-            [this]() {
+            [this, &pending]() {
                 return
-                    approval_resolved_ ||
+                    pending->resolved ||
                     shutting_down_;
             });
 
-        std::string decision =
-            approval_decision_;
+        const std::string decision =
+            pending->decision;
 
-        pending_approval_ =
-            AppServerClient::ApprovalRequest{};
-        approval_decision_.clear();
-        approval_waiting_ = false;
-        approval_resolved_ = false;
-
-        lock.unlock();
-        approval_condition_.notify_all();
+        pending_approvals_.erase(
+            std::remove(
+                pending_approvals_.begin(),
+                pending_approvals_.end(),
+                pending),
+            pending_approvals_.end());
 
         return decision.empty()
             ? "cancel"
@@ -12620,20 +18805,40 @@ button.approval-danger-button {
     }
 
     void handle_approval_request() {
+        std::shared_ptr<PendingApprovalState> pending;
         AppServerClient::ApprovalRequest request;
 
         {
             std::lock_guard<std::mutex> lock(
                 approval_mutex_);
 
-            if (
-                !approval_waiting_ ||
-                approval_resolved_
-            ) {
+            if (approval_dialog_open_) {
                 return;
             }
 
-            request = pending_approval_;
+            const auto matching =
+                std::find_if(
+                    pending_approvals_.begin(),
+                    pending_approvals_.end(),
+                    [this](
+                        const std::shared_ptr<
+                            PendingApprovalState>& candidate
+                    ) {
+                        return
+                            candidate != nullptr &&
+                            !candidate->resolved &&
+                            candidate->request.thread_id ==
+                                current_thread_id_;
+                    });
+
+            if (matching == pending_approvals_.end()) {
+                schedule_sidebar_refresh();
+                return;
+            }
+
+            pending = *matching;
+            request = pending->request;
+            approval_dialog_open_ = true;
         }
 
         const auto nullable_string =
@@ -12675,6 +18880,9 @@ button.approval-danger-button {
         const bool command_approval =
             request.method ==
             "item/commandExecution/requestApproval";
+        const bool permissions_approval =
+            request.method ==
+            "item/permissions/requestApproval";
 
         const std::string reason =
             nullable_string("reason");
@@ -12732,7 +18940,62 @@ button.approval-danger-button {
             append_permission_detail(
                 "Proposed network policy amendments",
                 json_string("proposedNetworkPolicyAmendments"));
+        } else if (permissions_approval) {
+            append_permission_detail(
+                "Requested permissions",
+                json_string("permissions"));
+            append_permission_detail(
+                "Environment",
+                json_string("environmentId"));
         }
+
+        const std::string approval_title =
+            command_approval
+                ? "Run this command?"
+                : (
+                    permissions_approval
+                        ? "Grant these permissions?"
+                        : "Allow these file changes?"
+                );
+
+        const std::string approval_summary =
+            command_approval
+                ? "Codex needs your approval before it can run this command."
+                : (
+                    permissions_approval
+                        ? "Codex needs additional access before it can continue."
+                        : "Codex needs your approval before it can write these changes."
+                );
+
+        const std::string action_heading =
+            command_approval
+                ? "COMMAND"
+                : (
+                    permissions_approval
+                        ? "REQUESTED ACCESS"
+                        : "WRITE ACCESS"
+                );
+
+        const std::string action_text =
+            command_approval
+                ? (
+                    command.empty()
+                        ? "Command details unavailable"
+                        : command
+                )
+                : (
+                    permissions_approval
+                        ? (
+                            json_string("permissions").empty()
+                                ? "Permission details unavailable"
+                                : json_string("permissions")
+                        )
+                        : (
+                            grant_root.empty()
+                                ? "Requested files were not specified"
+                                : grant_root
+                        )
+                );
 
         status_label_.set_text(
             "Codex: approval required");
@@ -12775,10 +19038,7 @@ button.approval-danger-button {
             eyebrow,
             Gtk::PACK_SHRINK);
 
-        Gtk::Label title(
-            command_approval
-                ? "Run this command?"
-                : "Allow these file changes?");
+        Gtk::Label title(approval_title);
 
         title.set_xalign(0.0F);
         title.get_style_context()->add_class(
@@ -12787,12 +19047,7 @@ button.approval-danger-button {
             title,
             Gtk::PACK_SHRINK);
 
-        Gtk::Label summary(
-            command_approval
-                ? "Codex needs your approval before it can "
-                    "run this command."
-                : "Codex needs your approval before it can "
-                    "write these changes.");
+        Gtk::Label summary(approval_summary);
 
         summary.set_xalign(0.0F);
         summary.set_line_wrap(true);
@@ -12809,10 +19064,7 @@ button.approval-danger-button {
         action_card.get_style_context()->add_class(
             "approval-card");
 
-        Gtk::Label action_label(
-            command_approval
-                ? "COMMAND"
-                : "WRITE ACCESS");
+        Gtk::Label action_label(action_heading);
 
         action_label.set_xalign(0.0F);
         action_label.get_style_context()->add_class(
@@ -12821,18 +19073,7 @@ button.approval-danger-button {
             action_label,
             Gtk::PACK_SHRINK);
 
-        Gtk::Label action_value(
-            command_approval
-                ? (
-                    command.empty()
-                        ? "Command details unavailable"
-                        : command
-                )
-                : (
-                    grant_root.empty()
-                        ? "Requested files were not specified"
-                        : grant_root
-                ));
+        Gtk::Label action_value(action_text);
 
         action_value.set_xalign(0.0F);
         action_value.set_line_wrap(true);
@@ -12888,11 +19129,11 @@ button.approval-danger-button {
             Gtk::ORIENTATION_VERTICAL,
             3);
         Gtk::Label location_key(
-            command_approval
+            command_approval || permissions_approval
                 ? "WORKING DIRECTORY"
                 : "PROJECT");
         Gtk::Label location_value(
-            command_approval
+            command_approval || permissions_approval
                 ? (
                     cwd.empty()
                         ? "Not specified"
@@ -12967,10 +19208,12 @@ button.approval-danger-button {
 
         Gtk::Label footnote(
             command_approval
-                ? "Approve only if you recognize the command "
-                    "and the access it requests."
-                : "Approve only if this write access matches "
-                    "the change you asked Codex to make.");
+                ? "Approve only if you recognize the command and the access it requests."
+                : (
+                    permissions_approval
+                        ? "Approve only if this access matches the work you asked Codex to perform."
+                        : "Approve only if this write access matches the change you asked Codex to make."
+                ));
 
         footnote.set_xalign(0.0F);
         footnote.set_line_wrap(true);
@@ -13068,16 +19311,23 @@ button.approval-danger-button {
                 approval_mutex_);
 
             if (
-                approval_waiting_ &&
-                !approval_resolved_
+                pending != nullptr &&
+                !pending->resolved
             ) {
-                approval_decision_ =
+                pending->decision =
                     decision;
-                approval_resolved_ = true;
+                pending->resolved = true;
             }
+
+            approval_dialog_open_ = false;
         }
 
-        approval_condition_.notify_all();
+        if (pending != nullptr) {
+            pending->condition.notify_all();
+        }
+
+        schedule_sidebar_refresh();
+        approval_dispatcher_.emit();
 
         if (
             turn_in_progress_ &&
@@ -13183,6 +19433,10 @@ button.approval-danger-button {
                     pending !=
                     session->follow_up_request_entries.end()
                 ) {
+                    const bool pause_request =
+                        pending->second.rfind(
+                            "threaddeck-pause-",
+                            0) == 0;
                     LiveTurnEntry* entry =
                         find_live_entry(
                             *session,
@@ -13198,6 +19452,11 @@ button.approval-danger-button {
                         entry->output =
                             app_server_error_message(
                                 event.message);
+
+                        if (pause_request) {
+                            pause_requested_threads_.erase(
+                                session->thread_id);
+                        }
                     }
 
                     session->follow_up_request_entries.erase(
@@ -13216,6 +19475,7 @@ button.approval-danger-button {
                                 SteerAccepted
                             ? "Codex: follow-up accepted"
                             : "Codex: follow-up rejected");
+                    update_pause_button();
                 }
 
                 break;
@@ -13224,26 +19484,24 @@ button.approval-danger-button {
             case AppServerClient::TurnEvent::Type::
                 AgentMessageDelta:
                 session->agent_text += event.delta;
-                ensure_live_entry(
-                    *session,
-                    LiveEntryKind::AgentMessage,
-                    event.item_id)
-                    .text += event.delta;
-                transcript_changed_threads.insert(
-                    session->thread_id);
+                append_live_text_delta(
+                    ensure_live_entry(
+                        *session,
+                        LiveEntryKind::AgentMessage,
+                        event.item_id),
+                    event.delta);
                 break;
 
             case AppServerClient::TurnEvent::Type::
                 ReasoningSummaryDelta:
                 session->reasoning_summary +=
                     event.delta;
-                ensure_live_entry(
-                    *session,
-                    LiveEntryKind::Reasoning,
-                    event.item_id)
-                    .text += event.delta;
-                transcript_changed_threads.insert(
-                    session->thread_id);
+                append_live_text_delta(
+                    ensure_live_entry(
+                        *session,
+                        LiveEntryKind::Reasoning,
+                        event.item_id),
+                    event.delta);
                 break;
 
             case AppServerClient::TurnEvent::Type::
@@ -13252,14 +19510,13 @@ button.approval-danger-button {
 
             case AppServerClient::TurnEvent::Type::
                 PlanDelta:
-                ensure_live_entry(
-                    *session,
-                    LiveEntryKind::Plan,
-                    event.item_id,
-                    "plan")
-                    .text += event.delta;
-                transcript_changed_threads.insert(
-                    session->thread_id);
+                append_live_text_delta(
+                    ensure_live_entry(
+                        *session,
+                        LiveEntryKind::Plan,
+                        event.item_id,
+                        "plan"),
+                    event.delta);
                 break;
 
             case AppServerClient::TurnEvent::Type::
@@ -13430,24 +19687,45 @@ button.approval-danger-button {
                         event.message["params"][
                             "rateLimits"];
 
+                    const std::string update_limit_id =
+                        json_string_field(
+                            update,
+                            "limitId");
+
                     auto& snapshot =
                         account_rate_limits_[
                             "rateLimits"];
 
-                    if (!snapshot.is_object()) {
-                        snapshot =
-                            nlohmann::json::object();
+                    const std::string snapshot_limit_id =
+                        json_string_field(
+                            snapshot,
+                            "limitId");
+
+                    if (
+                        update_limit_id.empty() ||
+                        snapshot_limit_id.empty() ||
+                        update_limit_id ==
+                            snapshot_limit_id
+                    ) {
+                        merge_sparse_json_object(
+                            snapshot,
+                            update);
                     }
 
-                    for (
-                        auto field = update.begin();
-                        field != update.end();
-                        ++field
-                    ) {
-                        if (!field.value().is_null()) {
-                            snapshot[field.key()] =
-                                field.value();
+                    if (!update_limit_id.empty()) {
+                        auto& snapshots_by_id =
+                            account_rate_limits_[
+                                "rateLimitsByLimitId"];
+
+                        if (!snapshots_by_id.is_object()) {
+                            snapshots_by_id =
+                                nlohmann::json::object();
                         }
+
+                        merge_sparse_json_object(
+                            snapshots_by_id[
+                                update_limit_id],
+                            update);
                     }
 
                     refresh_usage_label();
@@ -13464,6 +19742,17 @@ button.approval-danger-button {
                     json_string_field(
                         event.item,
                         "type");
+
+                if (
+                    type == "commandExecution" &&
+                    event.item.contains("command") &&
+                    event.item["command"].is_string()
+                ) {
+                    observe_remote_host_from_command(
+                        session->thread_id,
+                        event.item["command"]
+                            .get<std::string>());
+                }
 
                 if (type == "userMessage") {
                     break;
@@ -13493,9 +19782,12 @@ button.approval-danger-button {
                             .get<std::string>();
                     }
 
-                    if (!entry.text.empty()) {
-                        transcript_changed_threads.insert(
-                            session->thread_id);
+                    if (
+                        event.type ==
+                            AppServerClient::TurnEvent::Type::
+                                ItemCompleted
+                    ) {
+                        complete_live_text_entry(entry);
                     }
                     break;
                 }
@@ -13538,9 +19830,12 @@ button.approval-danger-button {
                         }
                     }
 
-                    if (!entry.text.empty()) {
-                        transcript_changed_threads.insert(
-                            session->thread_id);
+                    if (
+                        event.type ==
+                            AppServerClient::TurnEvent::Type::
+                                ItemCompleted
+                    ) {
+                        complete_live_text_entry(entry);
                     }
                     break;
                 }
@@ -13562,12 +19857,9 @@ button.approval-danger-button {
                             event.item,
                             "text",
                             entry.text);
+                        complete_live_text_entry(entry);
                     }
 
-                    if (!entry.text.empty()) {
-                        transcript_changed_threads.insert(
-                            session->thread_id);
-                    }
                     break;
                 }
 
@@ -13581,7 +19873,19 @@ button.approval-danger-button {
                 entry.type = type;
                 entry.label =
                     activity_label(type);
-                entry.item = event.item;
+                if (!entry.item.is_object()) {
+                    entry.item =
+                        nlohmann::json::object();
+                }
+
+                for (
+                    auto field = event.item.begin();
+                    field != event.item.end();
+                    ++field
+                ) {
+                    entry.item[field.key()] =
+                        field.value();
+                }
                 entry.state =
                     event.type ==
                         AppServerClient::TurnEvent::Type::
@@ -13717,8 +20021,111 @@ button.approval-danger-button {
                     session.pending_follow_ups.front());
             session.pending_follow_ups.pop_front();
 
-            send_follow_up(session, follow_up);
+            if (!send_follow_up(session, follow_up)) {
+                if (
+                    follow_up.entry_id.rfind(
+                        "threaddeck-pause-",
+                        0) == 0
+                ) {
+                    pause_requested_threads_.erase(
+                        session.thread_id);
+
+                    if (
+                        session.thread_id ==
+                        current_thread_id_
+                    ) {
+                        update_pause_button();
+                    }
+                }
+            }
         }
+    }
+
+    void continue_current_thread() {
+        if (current_thread_id_.empty()) {
+            status_label_.set_text(
+                "Codex: no active thread to continue");
+            return;
+        }
+
+        ThreadTurnSession* session =
+            find_turn_session(current_thread_id_);
+
+        if (
+            session != nullptr &&
+            session->busy
+        ) {
+            if (
+                session->work_kind !=
+                    SessionWorkKind::Turn ||
+                session->stop_requested
+            ) {
+                status_label_.set_text(
+                    "Codex: this thread cannot continue yet");
+                return;
+            }
+
+            PendingFollowUp follow_up;
+            follow_up.entry_id =
+                "threaddeck-follow-up-" +
+                std::to_string(
+                    ++follow_up_sequence_);
+            follow_up.input.push_back(
+                {
+                    {"type", "text"},
+                    {"text", "continue"},
+                    {"text_elements",
+                     nlohmann::json::array()},
+                });
+
+            LiveTurnEntry entry;
+            entry.kind = LiveEntryKind::FollowUp;
+            entry.item_id = follow_up.entry_id;
+            entry.state = "queued";
+            entry.text = "continue";
+            session->live_entries.push_back(
+                std::move(entry));
+
+            if (session->active_turn_id.empty()) {
+                session->pending_follow_ups.push_back(
+                    std::move(follow_up));
+                status_label_.set_text(
+                    "Codex: continue queued for this thread");
+            } else if (
+                send_follow_up(
+                    *session,
+                    follow_up)
+            ) {
+                status_label_.set_text(
+                    "Codex: continue sent to this thread");
+            } else {
+                status_label_.set_text(
+                    "Codex: continue could not be sent");
+            }
+
+            render_live_turn(*session);
+            update_send_button_state();
+            return;
+        }
+
+        nlohmann::json turn_input =
+            nlohmann::json::array();
+        turn_input.push_back(
+            {
+                {"type", "text"},
+                {"text", "continue"},
+                {"text_elements",
+                 nlohmann::json::array()},
+            });
+
+        append_user_content_to_transcript(
+            turn_input);
+
+        start_structured_turn(
+            current_thread_id_,
+            turn_input,
+            turn_input,
+            current_session_options());
     }
 
     void submit_follow_up() {
@@ -13727,13 +20134,16 @@ button.approval-danger-button {
 
         const std::string text = trim(
             prompt_.get_buffer()->get_text().raw());
+        const bool has_attachments =
+            !attached_image_paths_.empty() ||
+            !attached_audio_paths_.empty();
 
         if (
             session == nullptr ||
             !session->busy ||
             session->work_kind !=
                 SessionWorkKind::Turn ||
-            text.empty()
+            (text.empty() && !has_attachments)
         ) {
             return;
         }
@@ -13743,23 +20153,72 @@ button.approval-danger-button {
             "threaddeck-follow-up-" +
             std::to_string(
                 ++follow_up_sequence_);
-        follow_up.input.push_back(
-            {
-                {"type", "text"},
-                {"text", text},
-                {"text_elements",
-                 nlohmann::json::array()},
-            });
+        if (!text.empty()) {
+            follow_up.input.push_back(
+                {
+                    {"type", "text"},
+                    {"text", text},
+                    {"text_elements",
+                     nlohmann::json::array()},
+                });
+        }
+
+        for (const auto& image_path :
+             attached_image_paths_) {
+            follow_up.input.push_back(
+                {
+                    {"type", "localImage"},
+                    {"path", image_path},
+                });
+        }
+
+        for (const auto& audio_path :
+             attached_audio_paths_) {
+            follow_up.input.push_back(
+                {
+                    {"type", "localAudio"},
+                    {"path", audio_path},
+                });
+        }
 
         LiveTurnEntry entry;
         entry.kind = LiveEntryKind::FollowUp;
         entry.item_id = follow_up.entry_id;
         entry.state = "queued";
         entry.text = text;
+
+        for (const auto& image_path :
+             attached_image_paths_) {
+            if (!entry.text.empty()) {
+                entry.text += '\n';
+            }
+
+            entry.text +=
+                "Attached image: " +
+                std::filesystem::path(image_path)
+                    .filename().string();
+        }
+
+        for (const auto& audio_path :
+             attached_audio_paths_) {
+            if (!entry.text.empty()) {
+                entry.text += '\n';
+            }
+
+            entry.text +=
+                "Attached audio: " +
+                std::filesystem::path(audio_path)
+                    .filename().string();
+        }
+
         session->live_entries.push_back(
             std::move(entry));
 
-        prompt_.get_buffer()->set_text("");
+        queued_temporary_attachment_paths_.clear();
+        clear_prompt_after_submission();
+        attached_image_paths_.clear();
+        attached_audio_paths_.clear();
+        refresh_attachment_row();
         skill_popover_.popdown();
 
         if (session->active_turn_id.empty()) {
@@ -13860,12 +20319,16 @@ button.approval-danger-button {
         if (session != nullptr && session->busy) {
             const std::string follow_up_text = trim(
                 prompt_.get_buffer()->get_text().raw());
+            const bool has_follow_up =
+                !follow_up_text.empty() ||
+                !attached_image_paths_.empty() ||
+                !attached_audio_paths_.empty();
 
             if (
                 session != nullptr &&
                 session->work_kind ==
                     SessionWorkKind::Turn &&
-                !follow_up_text.empty()
+                has_follow_up
             ) {
                 submit_follow_up();
             } else {
@@ -13875,6 +20338,142 @@ button.approval-danger-button {
         }
 
         submit_prompt();
+    }
+
+    void start_structured_turn(
+        const std::string& thread_id,
+        const nlohmann::json& turn_input,
+        const nlohmann::json& transcript_input,
+        const AppServerClient::SessionOptions&
+            session_options
+    ) {
+        auto& session_pointer =
+            turn_sessions_[thread_id];
+
+        if (!session_pointer) {
+            session_pointer =
+                std::make_unique<
+                    ThreadTurnSession>();
+            session_pointer->thread_id =
+                thread_id;
+        }
+
+        ThreadTurnSession& session =
+            *session_pointer;
+
+        const bool was_paused =
+            paused_threads_.erase(thread_id) > 0;
+        pause_requested_threads_.erase(thread_id);
+
+        if (was_paused) {
+            save_ui_state();
+        }
+
+        if (thread_id == current_thread_id_) {
+            update_pause_button();
+        }
+
+        if (session.worker.joinable()) {
+            session.worker.join();
+        }
+
+        session.cwd = selected_folder_path_;
+        session.busy = true;
+        session.failed = false;
+        session.work_kind =
+            SessionWorkKind::Turn;
+        session.base_thread = current_thread_data_;
+        session.transcript_input =
+            transcript_input;
+        session.pending_display.clear();
+        session.options = session_options;
+        session.options.cwd = session.cwd;
+        session.mode = effective_mode_;
+        prepare_session_process_environment(session);
+
+        if (!session.client) {
+            session.client =
+                std::make_unique<
+                    AppServerClient>();
+        }
+
+        begin_live_turn(session);
+
+        status_label_.set_text("Codex: working");
+        current_thread_turn_failed_ = false;
+        set_turn_busy(true);
+        refresh_sidebar_threads();
+
+        std::cout
+            << "PASS: GTK submitted a turn for thread "
+            << thread_id
+            << '\n';
+
+        session.worker = std::thread(
+            [
+                this,
+                session = &session,
+                thread_id,
+                turn_input,
+                session_options
+            ]() {
+                AppServerClient::TurnResult result;
+                std::string error;
+
+                if (
+                    ensure_session_client_ready(
+                        *session,
+                        session_options,
+                        error)
+                ) {
+                    result =
+                        session->client
+                            ->start_turn_with_input(
+                                thread_id,
+                                turn_input,
+                                60000,
+                                [this](
+                                    const AppServerClient::TurnEvent& event
+                                ) {
+                                    {
+                                        std::lock_guard<
+                                            std::mutex
+                                        > lock(
+                                            turn_event_mutex_);
+                                        pending_turn_events_
+                                            .push_back(event);
+                                    }
+
+                                    turn_event_dispatcher_.emit();
+                                },
+                                [this](
+                                    const AppServerClient::ApprovalRequest&
+                                        request
+                                ) {
+                                    return request_approval(
+                                        request);
+                                },
+                                session_options);
+                } else {
+                    result.error =
+                        "Could not prepare the thread's "
+                        "Codex App Server: " +
+                        error;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        turn_result_mutex_);
+
+                    pending_turn_results_.push_back(
+                        {
+                            thread_id,
+                            std::move(result),
+                        });
+                }
+
+                turn_dispatcher_.emit();
+            });
     }
 
     void set_shell_command_busy(bool busy) {
@@ -13918,6 +20517,7 @@ button.approval-danger-button {
 
         update_send_button_state();
         refresh_session_control_sensitivity();
+        update_pause_button();
     }
 
     void create_thread_for_selected_folder() {
@@ -14070,7 +20670,7 @@ button.approval-danger-button {
         prompt_.set_editable(true);
         prompt_.set_cursor_visible(true);
         prompt_.set_can_focus(true);
-        prompt_.get_buffer()->set_text("");
+        clear_prompt_after_submission();
         update_send_button_state();
 
         transcript_.get_buffer()->set_text(
@@ -14145,7 +20745,7 @@ button.approval-danger-button {
                     AppServerClient>();
         }
 
-        prompt_.get_buffer()->set_text("");
+        clear_prompt_after_submission();
         skill_popover_.popdown();
 
         begin_live_turn(session);
@@ -14334,7 +20934,7 @@ button.approval-danger-button {
                         AppServerClient>();
             }
 
-            prompt_.get_buffer()->set_text("");
+            clear_prompt_after_submission();
 
             append_transcript(
                 session.pending_display,
@@ -14510,7 +21110,7 @@ button.approval-danger-button {
 
         queued_temporary_attachment_paths_.clear();
 
-        prompt_.get_buffer()->set_text("");
+        clear_prompt_after_submission();
         skill_popover_.popdown();
 
         append_user_content_to_transcript(
@@ -14673,6 +21273,9 @@ button.approval-danger-button {
                 completed.thread_id ==
                 current_thread_id_;
 
+            completed_unseen_threads_.erase(
+                completed.thread_id);
+
             session->busy = false;
             session->work_kind =
                 SessionWorkKind::None;
@@ -14804,6 +21407,18 @@ button.approval-danger-button {
                     ")";
             }
 
+            if (
+                !is_current &&
+                (!has_exit_code || exit_code == 0)
+            ) {
+                completed_unseen_threads_.insert(
+                    completed.thread_id);
+            }
+
+            if (!has_exit_code || exit_code == 0) {
+                play_task_completion_sound();
+            }
+
             if (is_current) {
                 append_transcript(
                     label +
@@ -14887,9 +21502,16 @@ button.approval-danger-button {
             AppServerClient::TurnResult& result =
                 completed.result;
 
+            const bool safe_pause_requested =
+                pause_requested_threads_.erase(
+                    completed.thread_id) > 0;
+
             const bool is_current =
                 completed.thread_id ==
                 current_thread_id_;
+
+            completed_unseen_threads_.erase(
+                completed.thread_id);
 
             if (
                 !result.streamed_text.empty() &&
@@ -14936,6 +21558,24 @@ button.approval-danger-button {
                     }
                 }
 
+            }
+
+            bool flushed_live_text = false;
+
+            for (LiveTurnEntry& entry : session->live_entries) {
+                if (!live_stream_text_entry(entry)) {
+                    continue;
+                }
+
+                entry.stream_complete = true;
+
+                if (entry.displayed_text != entry.text) {
+                    entry.displayed_text = entry.text;
+                    flushed_live_text = true;
+                }
+            }
+
+            if (flushed_live_text) {
                 render_live_turn(*session);
             }
 
@@ -15006,6 +21646,10 @@ button.approval-danger-button {
                     << result.error
                     << '\n';
 
+                if (is_current) {
+                    update_pause_button();
+                }
+
                 continue;
             }
 
@@ -15015,6 +21659,36 @@ button.approval-danger-button {
                 session->transcript_input);
 
             if (result.status == "completed") {
+                if (safe_pause_requested) {
+                    paused_threads_.insert(
+                        completed.thread_id);
+                }
+
+                play_task_completion_sound();
+
+                if (!is_current) {
+                    completed_unseen_threads_.insert(
+                        completed.thread_id);
+                }
+
+                bool command_auto_copied = false;
+
+                if (
+                    is_current &&
+                    thread_auto_copy_selections_.find(
+                        completed.thread_id) !=
+                        thread_auto_copy_selections_.end()
+                ) {
+                    const std::string command =
+                        last_shell_code_block(
+                            !result.streamed_text.empty()
+                                ? result.streamed_text
+                                : session->agent_text);
+
+                    command_auto_copied =
+                        copy_text_to_clipboard(command);
+                }
+
                 finalize_live_activities(
                     *session,
                     "completed");
@@ -15047,8 +21721,14 @@ button.approval-danger-button {
 
                 if (is_current) {
                     status_label_.set_text(
-                        generated_title_saved
-                            ? "Codex: connected"
+                        safe_pause_requested
+                            ? "Codex: paused at a safe checkpoint"
+                            : generated_title_saved
+                            ? (
+                                command_auto_copied
+                                    ? "Codex: connected · command copied"
+                                    : "Codex: connected"
+                            )
                             : "Codex: summary completed without a title");
 
                     if (!generated_title_saved) {
@@ -15174,6 +21854,7 @@ button.approval-danger-button {
             if (is_current) {
                 session->transcript_buffer =
                     transcript_.get_buffer();
+                update_pause_button();
             }
 
             std::cout
@@ -15188,6 +21869,140 @@ button.approval-danger-button {
 
         save_ui_state();
         refresh_sidebar_threads();
+    }
+
+    void play_task_completion_sound() {
+        std::vector<std::filesystem::path> candidates;
+        std::error_code executable_error;
+        const auto executable =
+            std::filesystem::canonical(
+                "/proc/self/exe",
+                executable_error);
+
+        if (!executable_error) {
+            const auto executable_directory =
+                executable.parent_path();
+            candidates.push_back(
+                executable_directory /
+                "assets/sounds/task-complete.flac");
+            candidates.push_back(
+                executable_directory.parent_path() /
+                "assets/sounds/task-complete.flac");
+        }
+
+        candidates.push_back(
+            std::filesystem::path(
+                "assets/sounds/task-complete.flac"));
+        candidates.push_back(
+            std::filesystem::path(
+                "/usr/local/share/threaddeck/sounds/task-complete.flac"));
+        candidates.push_back(
+            std::filesystem::path(
+                "/usr/share/threaddeck/sounds/task-complete.flac"));
+
+        std::filesystem::path sound_path;
+
+        for (const auto& candidate : candidates) {
+            std::error_code exists_error;
+
+            if (
+                std::filesystem::is_regular_file(
+                    candidate,
+                    exists_error) &&
+                !exists_error
+            ) {
+                sound_path = candidate;
+                break;
+            }
+        }
+
+        if (sound_path.empty()) {
+            std::cerr
+                << "WARN: task completion sound is unavailable\n";
+            return;
+        }
+
+        std::filesystem::path player;
+        bool canberra_arguments = false;
+
+        for (
+            const auto& candidate :
+            {
+                std::filesystem::path{"/usr/bin/paplay"},
+                std::filesystem::path{"/usr/bin/pw-play"},
+                std::filesystem::path{
+                    "/usr/bin/canberra-gtk-play"},
+            }
+        ) {
+            std::error_code player_error;
+
+            if (
+                std::filesystem::is_regular_file(
+                    candidate,
+                    player_error) &&
+                !player_error
+            ) {
+                player = candidate;
+                canberra_arguments =
+                    candidate.filename() ==
+                    "canberra-gtk-play";
+                break;
+            }
+        }
+
+        if (player.empty()) {
+            std::cerr
+                << "WARN: no supported task completion sound player is available\n";
+            return;
+        }
+
+        std::string player_argument =
+            canberra_arguments
+                ? std::string("--file=") +
+                    sound_path.string()
+                : sound_path.string();
+        std::string player_path = player.string();
+        gchar* arguments[] = {
+            player_path.data(),
+            player_argument.data(),
+            nullptr,
+        };
+        GPid child_pid = 0;
+        GError* error = nullptr;
+
+        const gboolean started = g_spawn_async(
+            nullptr,
+            arguments,
+            nullptr,
+            static_cast<GSpawnFlags>(
+                G_SPAWN_DO_NOT_REAP_CHILD),
+            nullptr,
+            nullptr,
+            &child_pid,
+            &error);
+
+        if (!started) {
+            std::cerr
+                << "WARN: could not play task completion sound: "
+                << (
+                    error != nullptr
+                        ? error->message
+                        : "unknown player error")
+                << '\n';
+
+            if (error != nullptr) {
+                g_error_free(error);
+            }
+
+            return;
+        }
+
+        g_child_watch_add(
+            child_pid,
+            [](GPid pid, gint, gpointer) {
+                g_spawn_close_pid(pid);
+            },
+            nullptr);
     }
 
     void select_folder() {
@@ -15242,10 +22057,20 @@ button.approval-danger-button {
             update_send_button_state();
             refresh_sidebar_threads();
 
+            const bool create_initial_thread =
+                app_server_.is_running() &&
+                !selected_project_id_.empty() &&
+                !project_has_threads(
+                    selected_project_id_);
+
             std::cout
                 << "PASS: GTK added project folder "
                 << selected_folder_path_
                 << " without changing it on disk\n";
+
+            if (create_initial_thread) {
+                create_thread_for_selected_folder();
+            }
         }
     }
 
@@ -15253,6 +22078,7 @@ button.approval-danger-button {
     Gtk::Image shield_image_;
     Gtk::Box root_;
     Gtk::Paned body_;
+    Gtk::Paned main_workspace_{Gtk::ORIENTATION_HORIZONTAL};
     Gtk::Paned workspace_;
     Gtk::Box sidebar_;
     Gtk::Box content_{Gtk::ORIENTATION_VERTICAL};
@@ -15273,16 +22099,23 @@ button.approval-danger-button {
     Gtk::Image audio_attachment_image_;
     Gtk::Image send_image_;
     Gtk::Image transcript_bottom_image_;
+    Gtk::Image auto_copy_image_;
+    Gtk::Image pause_image_;
+    DoubleShieldIcon remote_shield_icon_;
 
     Gtk::MenuButton hamburger_button_;
     Gtk::ToggleButton sidebar_toggle_button_;
     Gtk::Button folder_button_;
     Gtk::Button new_thread_button_;
     Gtk::ToggleButton shield_button_;
+    Gtk::ToggleButton auto_copy_button_;
+    Gtk::Button pause_button_;
+    Gtk::ToggleButton remote_shield_button_;
     Gtk::ToggleButton context_toggle_button_;
     Gtk::Button attachment_button_;
     Gtk::Button audio_attachment_button_;
     Gtk::Button clear_attachments_button_;
+    Gtk::Button continue_button_;
     Gtk::Button send_button_;
     Gtk::Button transcript_bottom_button_;
     Gtk::ComboBoxText theme_selector_;
@@ -15303,6 +22136,17 @@ button.approval-danger-button {
     Gtk::Label selected_folder_;
     Gtk::Label status_label_;
     Gtk::Label sidebar_title_;
+    Gtk::Label remote_hosts_title_;
+
+    Gtk::Box remote_hosts_panel_{
+        Gtk::ORIENTATION_VERTICAL};
+    Gtk::Box remote_hosts_header_{
+        Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Button remote_hosts_add_button_;
+    Gtk::Button remote_hosts_close_button_;
+    Gtk::ScrolledWindow remote_hosts_scroll_;
+    Gtk::Box remote_hosts_list_{
+        Gtk::ORIENTATION_VERTICAL};
 
     Gtk::ScrolledWindow sidebar_scroll_;
     Gtk::Box sidebar_search_row_{
@@ -15374,6 +22218,9 @@ button.approval-danger-button {
     bool shield_enabled_{false};
     bool shield_operation_running_{false};
     bool shield_button_updating_{false};
+    bool auto_copy_button_updating_{false};
+    bool remote_shield_button_updating_{false};
+    bool remote_hosts_panel_visible_{false};
     std::string shield_operation_thread_id_;
 
     std::vector<std::string>
@@ -15420,6 +22267,9 @@ button.approval-danger-button {
         thread_access_selections_;
 
     std::map<std::string, std::string>
+        thread_model_selections_;
+
+    std::map<std::string, std::string>
         thread_reasoning_selections_;
 
     std::map<std::string, std::string>
@@ -15430,6 +22280,30 @@ button.approval-danger-button {
 
     std::set<std::string>
         thread_shield_selections_;
+
+    std::set<std::string>
+        thread_auto_copy_selections_;
+
+    std::map<std::string, std::string>
+        remote_host_labels_;
+
+    std::set<std::string>
+        remote_host_credential_saved_;
+
+    std::map<std::string, std::set<std::string>>
+        thread_remote_shield_hosts_;
+
+    std::map<std::string, std::set<std::string>>
+        thread_observed_remote_hosts_;
+
+    std::set<std::string>
+        paused_threads_;
+
+    std::set<std::string>
+        pause_requested_threads_;
+
+    std::set<std::string>
+        completed_unseen_threads_;
 
     std::map<std::string, nlohmann::json>
         thread_configured_approval_policies_;
@@ -15449,6 +22323,7 @@ button.approval-danger-button {
     std::string chooser_last_folder_;
 
     bool main_window_has_geometry_{false};
+    bool main_window_state_save_pending_{false};
     int main_window_x_{0};
     int main_window_y_{0};
     int main_window_width_{1200};
@@ -15471,6 +22346,7 @@ button.approval-danger-button {
     Glib::Dispatcher shield_dispatcher_;
     Glib::Dispatcher shell_command_dispatcher_;
     Glib::Dispatcher approval_dispatcher_;
+    Glib::Dispatcher thread_search_dispatcher_;
     std::mutex shell_command_result_mutex_;
     std::deque<CompletedShellCommand>
         pending_shell_command_results_;
@@ -15505,13 +22381,30 @@ button.approval-danger-button {
         pending_shield_results_;
 
     std::mutex approval_mutex_;
-    std::condition_variable approval_condition_;
-    AppServerClient::ApprovalRequest
-        pending_approval_;
-    std::string approval_decision_;
-    bool approval_waiting_{false};
-    bool approval_resolved_{false};
+    std::deque<
+        std::shared_ptr<PendingApprovalState>
+    > pending_approvals_;
+    bool approval_dialog_open_{false};
+    bool approval_blink_on_{false};
+    std::vector<Gtk::Widget*>
+        approval_question_rows_;
     bool shutting_down_{false};
+
+    std::thread thread_search_worker_;
+    std::mutex thread_search_mutex_;
+    std::condition_variable thread_search_condition_;
+    ThreadSearchRequest thread_search_request_;
+    std::deque<CompletedThreadSearch>
+        thread_search_completed_;
+    std::size_t thread_search_generation_{0};
+    std::size_t thread_search_latest_generation_{0};
+    bool thread_search_has_request_{false};
+    bool thread_search_stop_{false};
+    bool thread_search_loading_{false};
+    std::vector<nlohmann::json>
+        thread_search_results_;
+    std::string thread_search_result_term_;
+    std::string thread_search_error_;
 
     std::string active_turn_id_;
     bool stop_requested_{false};
@@ -15520,6 +22413,17 @@ button.approval-danger-button {
         std::string,
         std::unique_ptr<ThreadTurnSession>
     > turn_sessions_;
+
+    std::vector<TranscriptCopyButton>
+        transcript_copy_buttons_;
+    std::map<std::string, CodeCopyPayload>
+        code_copy_payloads_;
+    std::size_t code_copy_marker_sequence_{0};
+
+    Glib::RefPtr<Gdk::Cursor>
+        transcript_arrow_cursor_;
+    Glib::RefPtr<Gdk::Cursor>
+        transcript_hand_cursor_;
 
     Glib::RefPtr<Gtk::TextBuffer::Mark>
         transcript_end_mark_;
@@ -15540,7 +22444,35 @@ button.approval-danger-button {
     Glib::RefPtr<Gtk::TextTag>
         transcript_user_section_tag_;
     Glib::RefPtr<Gtk::TextTag>
+        transcript_user_marker_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_user_top_padding_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_user_bottom_padding_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_expand_activity_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_expand_token_tag_;
+    Glib::RefPtr<Gtk::TextTag>
         transcript_code_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_code_header_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_code_copy_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_marker_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_heading_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_bold_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_inline_code_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_quote_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_list_tag_;
+    Glib::RefPtr<Gtk::TextTag>
+        transcript_markdown_link_tag_;
     Glib::RefPtr<Gtk::TextTag>
         transcript_code_keyword_tag_;
     Glib::RefPtr<Gtk::TextTag>
@@ -15566,8 +22498,41 @@ button.approval-danger-button {
     double transcript_last_scroll_upper_{0.0};
     std::size_t follow_up_sequence_{0};
     std::size_t transcript_image_marker_sequence_{0};
+    std::map<
+        std::string,
+        ActivityExpansionPayload
+    >
+        activity_expansion_payloads_;
+    std::map<std::string, std::string>
+        activity_expansion_tokens_;
+    std::set<std::string>
+        expanded_activity_ids_;
+    std::size_t activity_expansion_sequence_{0};
     bool pasting_prompt_text_{false};
+    bool prompt_history_restoring_{false};
+    int prompt_history_transaction_depth_{0};
+    PromptEditSnapshot prompt_history_current_;
+    PromptEditSnapshot prompt_history_transaction_start_;
+    std::vector<PromptEditSnapshot>
+        prompt_undo_history_;
+    std::vector<PromptEditSnapshot>
+        prompt_redo_history_;
+    std::string composer_thread_id_;
+    std::map<std::string, ComposerDraft>
+        composer_drafts_;
+    std::map<
+        std::string,
+        std::vector<Glib::ustring>
+    > prompt_command_histories_;
+    std::set<std::string>
+        prompt_history_seeded_threads_;
+    std::map<
+        std::string,
+        PromptCommandHistoryNavigation
+    > prompt_command_history_navigation_;
     sigc::connection sidebar_search_connection_;
+    sigc::connection approval_blink_connection_;
+    sigc::connection live_text_reveal_connection_;
 };
 
 namespace {

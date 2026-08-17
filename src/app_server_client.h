@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <string>
 #include <functional>
 #include <map>
@@ -19,12 +20,17 @@ public:
     };
 
     struct SessionOptions {
+        SessionOptions()
+            : shield_enabled(false) {}
+
         std::string cwd;
         std::string model;
         std::string reasoning_effort;
         nlohmann::json approval_policy;
         std::string sandbox_mode;
         nlohmann::json sandbox_policy;
+        bool shield_enabled;
+        std::vector<std::string> remote_shield_hosts;
     };
 
     struct ProcessEnvironment {
@@ -34,6 +40,9 @@ public:
         bool shield_enabled{false};
         std::string shield_sudo_directory;
         std::string shield_executor_path;
+        std::string remote_shield_ssh_directory;
+        std::string remote_shield_hosts_json;
+        bool tablet_accessible{false};
     };
 
     struct JsonResult {
@@ -59,6 +68,15 @@ public:
     struct ThreadListResult {
         bool success{false};
         std::vector<nlohmann::json> threads;
+        std::string next_cursor;
+        nlohmann::json response;
+        std::vector<nlohmann::json> preceding_messages;
+        std::string error;
+    };
+
+    struct ThreadSearchResult {
+        bool success{false};
+        std::vector<nlohmann::json> matches;
         std::string next_cursor;
         nlohmann::json response;
         std::vector<nlohmann::json> preceding_messages;
@@ -206,6 +224,12 @@ public:
         const std::string& search_term = {},
         bool use_state_db_only = false);
 
+    ThreadSearchResult search_threads(
+        const std::string& search_term,
+        int limit = 100,
+        int timeout_ms = 10000,
+        const std::string& cursor = {});
+
     JsonResult delete_thread(
         const std::string& thread_id,
         int timeout_ms = 10000);
@@ -255,6 +279,7 @@ public:
         const std::string& expected_turn_id,
         const nlohmann::json& input);
 
+    void cancel_pending_operation();
     void shutdown();
 
     bool is_running() const;
@@ -284,10 +309,15 @@ private:
 
     int allocate_request_id();
     bool write_line(const std::string& line, std::string& error);
+    bool write_websocket_frame(
+        std::uint8_t opcode,
+        const std::string& payload,
+        std::string& error);
     std::string read_line(int timeout_ms, std::string& error);
     void collect_stderr();
 
     pid_t child_pid_{-1};
+    pid_t tablet_bridge_pid_{-1};
     int stdin_fd_{-1};
     int stdout_fd_{-1};
     int stderr_fd_{-1};
@@ -297,6 +327,9 @@ private:
     std::mutex steer_request_mutex_;
     std::map<int, std::string>
         pending_steer_requests_;
+    bool owns_app_server_socket_{false};
+    std::string app_server_socket_path_;
     std::string stdout_buffer_;
+    std::string websocket_message_buffer_;
     std::string stderr_output_;
 };

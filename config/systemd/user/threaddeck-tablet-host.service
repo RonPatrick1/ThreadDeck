@@ -1,0 +1,13 @@
+[Unit]
+Description=ThreadDeck tablet Codex host
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/CodexNativeUbuntu
+Environment=THREADDECK_TABLET_BRIDGE_EXTERNAL=1
+ExecStart=/var/www/CodexNativeUbuntu/build/threaddeck-tablet-host
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

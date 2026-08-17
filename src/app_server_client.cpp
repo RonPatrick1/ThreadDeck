@@ -1,16 +1,400 @@
 #include "app_server_client.h"
+#include "threaddeck_paths.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <random>
 #include <string>
 
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+
+constexpr const char* kThreadDeckFormattingContext =
+    "When you provide a shell command that the user should copy and run "
+    "themselves, put only the complete command in its own fenced code block "
+    "labeled bash (or the appropriate shell). Keep explanations, command "
+    "output, and other prose outside that fenced block.";
+
+constexpr const char* kThreadDeckShieldContext =
+    "ThreadDeck Shield is enabled for this local thread. A "
+    "ThreadDeck-managed sudo command is available in PATH and uses the "
+    "user's active privileged authorization. Use sudo when local privileged "
+    "work requires it; do not claim that sudo is unavailable merely because "
+    "it would normally prompt for a password. Shield is independent of YOLO: "
+    "normal Codex approvals and sandbox policy still apply unless YOLO is "
+    "also enabled. Shield applies only to this local ThreadDeck process and "
+    "does not provide sudo authentication on remote hosts reached through SSH.";
+
+nlohmann::json threaddeck_additional_context(
+    bool shield_enabled = false,
+    const std::vector<std::string>& remote_shield_hosts = {}
+) {
+    nlohmann::json context = {
+        {
+            "threaddeck.command-copy-format",
+            {
+                {"kind", "application"},
+                {"value", kThreadDeckFormattingContext},
+            },
+        },
+    };
+
+    if (shield_enabled) {
+        context["threaddeck.shield"] = {
+            {"kind", "application"},
+            {"value", kThreadDeckShieldContext},
+        };
+    }
+
+    if (!remote_shield_hosts.empty()) {
+        std::string hosts;
+
+        for (const auto& host : remote_shield_hosts) {
+            if (!hosts.empty()) {
+                hosts += ", ";
+            }
+
+            hosts += host;
+        }
+
+        context["threaddeck.remote-shield"] = {
+            {"kind", "application"},
+            {
+                "value",
+                "ThreadDeck Remote Shield is enabled for this thread on "
+                "these SSH destinations: " + hosts + ". SSH login uses the "
+                "user's normal OpenSSH keys and host verification. For a "
+                "privileged remote command, use the normal form `ssh HOST "
+                "sudo COMMAND`; ThreadDeck supplies that host's saved sudo "
+                "credential securely. Do not request or print the password, "
+                "do not add `sudo -S`, and do not claim remote sudo is "
+                "unavailable without attempting the enabled workflow. "
+                "Remote Shield is independent of YOLO and local Shield."
+            },
+        };
+    }
+
+    return context;
+}
+
+std::string base64_encode(
+    const std::array<unsigned char, 16>& bytes
+) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
+
+    std::string encoded;
+    encoded.reserve(24);
+
+    for (std::size_t index = 0; index < bytes.size(); index += 3) {
+        const std::size_t remaining =
+            bytes.size() - index;
+        const std::uint32_t first = bytes[index];
+        const std::uint32_t second =
+            remaining > 1 ? bytes[index + 1] : 0;
+        const std::uint32_t third =
+            remaining > 2 ? bytes[index + 2] : 0;
+        const std::uint32_t value =
+            (first << 16U) |
+            (second << 8U) |
+            third;
+
+        encoded.push_back(
+            alphabet[(value >> 18U) & 0x3fU]);
+        encoded.push_back(
+            alphabet[(value >> 12U) & 0x3fU]);
+        encoded.push_back(
+            remaining > 1
+                ? alphabet[(value >> 6U) & 0x3fU]
+                : '=');
+        encoded.push_back(
+            remaining > 2
+                ? alphabet[value & 0x3fU]
+                : '=');
+    }
+
+    return encoded;
+}
+
+bool send_all(
+    int fd,
+    const char* data,
+    std::size_t size,
+    std::string& error
+) {
+    std::size_t written = 0;
+
+    while (written < size) {
+        const ssize_t result =
+            ::send(
+                fd,
+                data + written,
+                size - written,
+                MSG_NOSIGNAL);
+
+        if (result > 0) {
+            written += static_cast<std::size_t>(result);
+            continue;
+        }
+
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+
+        error =
+            std::string("socket write failed: ") +
+            std::strerror(errno);
+        return false;
+    }
+
+    return true;
+}
+
+int connect_unix_socket(
+    const std::string& path
+) {
+    if (path.size() >= sizeof(sockaddr_un::sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    const int fd =
+        ::socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(
+        address.sun_path,
+        path.c_str(),
+        path.size() + 1);
+
+    if (
+        ::connect(
+            fd,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)) != 0
+    ) {
+        const int connect_error = errno;
+        ::close(fd);
+        errno = connect_error;
+        return -1;
+    }
+
+    return fd;
+}
+
+bool websocket_handshake(
+    int fd,
+    std::string& error
+) {
+    std::array<unsigned char, 16> nonce{};
+    std::random_device random;
+
+    for (auto& byte : nonce) {
+        byte = static_cast<unsigned char>(random());
+    }
+
+    const std::string request =
+        "GET / HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: " +
+        base64_encode(nonce) +
+        "\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    if (!send_all(fd, request.data(), request.size(), error)) {
+        return false;
+    }
+
+    std::string response;
+    response.reserve(1024);
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(10);
+
+    while (
+        response.find("\r\n\r\n") ==
+            std::string::npos &&
+        response.size() < 16384
+    ) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+
+        if (remaining.count() <= 0) {
+            error = "WebSocket handshake timed out";
+            return false;
+        }
+
+        pollfd descriptor{
+            fd,
+            static_cast<short>(POLLIN | POLLHUP),
+            0,
+        };
+
+        const int poll_result =
+            ::poll(
+                &descriptor,
+                1,
+                static_cast<int>(remaining.count()));
+
+        if (poll_result == 0) {
+            error = "WebSocket handshake timed out";
+            return false;
+        }
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            error =
+                std::string("WebSocket handshake poll failed: ") +
+                std::strerror(errno);
+            return false;
+        }
+
+        char byte = '\0';
+        const ssize_t read_result =
+            ::recv(fd, &byte, 1, 0);
+
+        if (read_result == 1) {
+            response.push_back(byte);
+            continue;
+        }
+
+        error = "App Server closed during WebSocket handshake";
+        return false;
+    }
+
+    if (
+        response.rfind("HTTP/1.1 101", 0) != 0 &&
+        response.rfind("HTTP/1.0 101", 0) != 0
+    ) {
+        error =
+            "App Server rejected the WebSocket handshake: " +
+            response.substr(0, response.find("\r\n"));
+        return false;
+    }
+
+    return true;
+}
+
+std::atomic<unsigned int> app_server_instance_counter{0};
+
+std::filesystem::path sibling_executable(
+    const std::string& name
+) {
+    std::error_code error;
+    const auto executable =
+        std::filesystem::read_symlink(
+            "/proc/self/exe",
+            error);
+
+    if (error || executable.empty()) {
+        return {};
+    }
+
+    return executable.parent_path() / name;
+}
+
+void signal_process(
+    pid_t pid,
+    int signal_number,
+    bool process_group
+) {
+    if (pid <= 0) {
+        return;
+    }
+
+    if (process_group) {
+        ::kill(-pid, signal_number);
+    }
+
+    ::kill(pid, signal_number);
+}
+
+void terminate_and_reap_process(
+    pid_t& pid,
+    bool process_group
+) {
+    if (pid <= 0) {
+        pid = -1;
+        return;
+    }
+
+    const pid_t target = pid;
+    signal_process(target, SIGTERM, process_group);
+
+    auto wait_until =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(900);
+
+    while (std::chrono::steady_clock::now() < wait_until) {
+        int status = 0;
+        const pid_t waited =
+            ::waitpid(target, &status, WNOHANG);
+
+        if (waited == target || (waited < 0 && errno == ECHILD)) {
+            pid = -1;
+            return;
+        }
+
+        if (waited < 0 && errno != EINTR) {
+            pid = -1;
+            return;
+        }
+
+        ::usleep(20000);
+    }
+
+    signal_process(target, SIGKILL, process_group);
+    wait_until =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(900);
+
+    while (std::chrono::steady_clock::now() < wait_until) {
+        int status = 0;
+        const pid_t waited =
+            ::waitpid(target, &status, WNOHANG);
+
+        if (waited == target || (waited < 0 && errno == ECHILD)) {
+            break;
+        }
+
+        if (waited < 0 && errno != EINTR) {
+            break;
+        }
+
+        ::usleep(20000);
+    }
+
+    pid = -1;
+}
+
+} // namespace
 
 AppServerClient::~AppServerClient() {
     shutdown();
@@ -27,6 +411,110 @@ bool AppServerClient::start(
     if (is_running()) {
         error = "App Server is already running";
         return false;
+    }
+
+    const std::filesystem::path runtime_directory =
+        threaddeck::runtime_directory();
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(
+        runtime_directory,
+        filesystem_error);
+
+    if (filesystem_error) {
+        error =
+            "Could not create ThreadDeck runtime directory: " +
+            filesystem_error.message();
+        return false;
+    }
+
+    ::chmod(runtime_directory.c_str(), 0700);
+
+    const auto attach_transport =
+        [this, &error](int transport_fd) {
+            if (!websocket_handshake(transport_fd, error)) {
+                ::close(transport_fd);
+                return false;
+            }
+
+            stdin_fd_ = transport_fd;
+            stdout_fd_ = ::dup(transport_fd);
+
+            if (stdout_fd_ < 0) {
+                error =
+                    std::string("Could not duplicate App Server socket: ") +
+                    std::strerror(errno);
+                ::close(stdin_fd_);
+                stdin_fd_ = -1;
+                return false;
+            }
+
+            stdout_buffer_.clear();
+            websocket_message_buffer_.clear();
+            stderr_output_.clear();
+            next_request_id_ = 1;
+            return true;
+        };
+
+    const std::filesystem::path shared_socket_path =
+        threaddeck::app_server_socket_path();
+
+    if (environment.tablet_accessible) {
+        const int shared_socket =
+            connect_unix_socket(
+                shared_socket_path.string());
+
+        if (shared_socket >= 0) {
+            app_server_socket_path_ =
+                shared_socket_path.string();
+            owns_app_server_socket_ = false;
+
+            if (!attach_transport(shared_socket)) {
+                app_server_socket_path_.clear();
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    app_server_socket_path_ =
+        (
+            environment.tablet_accessible
+                ? threaddeck::app_server_socket_path()
+                : runtime_directory /
+                    (
+                        "app-server-" +
+                        std::to_string(::getpid()) +
+                        "-" +
+                        std::to_string(
+                            ++app_server_instance_counter) +
+                        ".sock"
+                    )
+        ).string();
+    owns_app_server_socket_ = true;
+
+    const int existing_socket =
+        connect_unix_socket(app_server_socket_path_);
+
+    if (existing_socket >= 0) {
+        ::close(existing_socket);
+        error =
+            "Another ThreadDeck App Server is already using " +
+            app_server_socket_path_;
+        return false;
+    }
+
+    if (
+        std::filesystem::exists(
+            app_server_socket_path_,
+            filesystem_error)
+    ) {
+        if (::unlink(app_server_socket_path_.c_str()) != 0) {
+            error =
+                std::string("Could not remove stale App Server socket: ") +
+                std::strerror(errno);
+            return false;
+        }
     }
 
     int child_stdin[2]{};
@@ -71,6 +559,8 @@ bool AppServerClient::start(
     }
 
     if (child_pid_ == 0) {
+        ::setpgid(0, 0);
+
         ::dup2(child_stdin[0], STDIN_FILENO);
         ::dup2(child_stdout[1], STDOUT_FILENO);
         ::dup2(child_stderr[1], STDERR_FILENO);
@@ -113,12 +603,27 @@ bool AppServerClient::start(
             }
         }
 
-        if (environment.shield_enabled) {
+        if (
+            environment.shield_enabled ||
+            !environment.remote_shield_hosts_json.empty()
+        ) {
             const char* inherited_path =
                 ::getenv("PATH");
-            const std::string shield_path =
-                environment.shield_sudo_directory +
-                ":" +
+            std::string shield_path;
+
+            if (!environment.remote_shield_hosts_json.empty()) {
+                shield_path +=
+                    environment.remote_shield_ssh_directory +
+                    ":";
+            }
+
+            if (environment.shield_enabled) {
+                shield_path +=
+                    environment.shield_sudo_directory +
+                    ":";
+            }
+
+            shield_path +=
                 (
                     inherited_path == nullptr
                         ? std::string{"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
@@ -126,18 +631,45 @@ bool AppServerClient::start(
                 );
 
             const bool shield_ready =
-                !environment.shield_sudo_directory.empty() &&
-                !environment.shield_executor_path.empty() &&
+                (
+                    !environment.shield_enabled ||
+                    (
+                        !environment.shield_sudo_directory.empty() &&
+                        !environment.shield_executor_path.empty()
+                    )
+                ) &&
+                (
+                    environment.remote_shield_hosts_json.empty() ||
+                    !environment.remote_shield_ssh_directory.empty()
+                ) &&
                 ::setenv(
                     "PATH",
                     shield_path.c_str(),
-                    1) == 0 &&
-                ::setenv(
-                    "THREADDECK_SHIELD_EXECUTOR",
-                    environment.shield_executor_path.c_str(),
                     1) == 0;
 
-            if (!shield_ready) {
+            const bool local_shield_ready =
+                environment.shield_enabled
+                    ? ::setenv(
+                        "THREADDECK_SHIELD_EXECUTOR",
+                        environment.shield_executor_path.c_str(),
+                        1) == 0
+                    : ::unsetenv(
+                        "THREADDECK_SHIELD_EXECUTOR") == 0;
+
+            const bool remote_shield_ready =
+                environment.remote_shield_hosts_json.empty()
+                    ? ::unsetenv(
+                        "THREADDECK_REMOTE_SHIELD_HOSTS") == 0
+                    : ::setenv(
+                        "THREADDECK_REMOTE_SHIELD_HOSTS",
+                        environment.remote_shield_hosts_json.c_str(),
+                        1) == 0;
+
+            if (
+                !shield_ready ||
+                !local_shield_ready ||
+                !remote_shield_ready
+            ) {
                 const std::string message =
                     "Could not configure the ThreadDeck Shield environment\n";
 
@@ -149,13 +681,18 @@ bool AppServerClient::start(
             }
         } else {
             ::unsetenv("THREADDECK_SHIELD_EXECUTOR");
+            ::unsetenv("THREADDECK_REMOTE_SHIELD_HOSTS");
         }
 
         ::execlp(
             "codex",
             "codex",
             "app-server",
-            "--stdio",
+            "--listen",
+            (
+                "unix://" +
+                app_server_socket_path_
+            ).c_str(),
             static_cast<char*>(nullptr));
 
         const std::string message =
@@ -165,16 +702,133 @@ bool AppServerClient::start(
         _exit(127);
     }
 
+    ::setpgid(child_pid_, child_pid_);
+
     ::close(child_stdin[0]);
+    ::close(child_stdin[1]);
+    ::close(child_stdout[0]);
     ::close(child_stdout[1]);
     ::close(child_stderr[1]);
 
-    stdin_fd_ = child_stdin[1];
-    stdout_fd_ = child_stdout[0];
     stderr_fd_ = child_stderr[0];
-    stdout_buffer_.clear();
-    stderr_output_.clear();
-    next_request_id_ = 1;
+
+    const int stderr_flags =
+        ::fcntl(stderr_fd_, F_GETFL, 0);
+
+    if (stderr_flags >= 0) {
+        ::fcntl(
+            stderr_fd_,
+            F_SETFL,
+            stderr_flags | O_NONBLOCK);
+    }
+    int transport_fd = -1;
+    const auto connection_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(10);
+
+    while (
+        std::chrono::steady_clock::now() <
+        connection_deadline
+    ) {
+        transport_fd =
+            connect_unix_socket(
+                app_server_socket_path_);
+
+        if (transport_fd >= 0) {
+            break;
+        }
+
+        int child_status = 0;
+        const pid_t wait_result =
+            ::waitpid(
+                child_pid_,
+                &child_status,
+                WNOHANG);
+
+        if (wait_result == child_pid_) {
+            child_pid_ = -1;
+            collect_stderr();
+            error =
+                "App Server exited before opening its socket";
+
+            if (!stderr_output_.empty()) {
+                error += ": " + stderr_output_;
+            }
+
+            ::close(stderr_fd_);
+            stderr_fd_ = -1;
+            return false;
+        }
+
+        ::usleep(50000);
+    }
+
+    if (transport_fd < 0) {
+        error =
+            std::string("Could not connect to App Server socket: ") +
+            std::strerror(errno);
+        shutdown();
+        return false;
+    }
+
+    if (!attach_transport(transport_fd)) {
+        shutdown();
+        return false;
+    }
+
+    const char* external_tablet_bridge =
+        std::getenv("THREADDECK_TABLET_BRIDGE_EXTERNAL");
+    const bool should_start_tablet_bridge =
+        environment.tablet_accessible &&
+        !(
+            external_tablet_bridge != nullptr &&
+            std::string(external_tablet_bridge) == "1"
+        );
+
+    if (should_start_tablet_bridge) {
+        const std::filesystem::path bridge_path =
+            sibling_executable(
+                "threaddeck-tablet-bridge");
+
+        if (
+            !bridge_path.empty() &&
+            std::filesystem::is_regular_file(
+                bridge_path,
+                filesystem_error)
+        ) {
+            tablet_bridge_pid_ = ::fork();
+
+            if (tablet_bridge_pid_ == 0) {
+                const std::string port =
+                    std::to_string(
+                        threaddeck::kTabletBridgePort);
+
+                ::execl(
+                    bridge_path.c_str(),
+                    bridge_path.c_str(),
+                    "--socket",
+                    app_server_socket_path_.c_str(),
+                    "--port",
+                    port.c_str(),
+                    static_cast<char*>(nullptr));
+
+                _exit(127);
+            }
+
+            if (tablet_bridge_pid_ < 0) {
+                tablet_bridge_pid_ = -1;
+                std::cerr
+                    << "WARN: could not start the ThreadDeck "
+                       "tablet bridge: "
+                    << std::strerror(errno)
+                    << '\n';
+            }
+        } else {
+            std::cerr
+                << "WARN: ThreadDeck tablet bridge executable "
+                   "was not found beside the application\n";
+        }
+    }
 
     return true;
 }
@@ -974,6 +1628,100 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
     return result;
 }
 
+AppServerClient::ThreadSearchResult AppServerClient::search_threads(
+    const std::string& search_term,
+    int limit,
+    int timeout_ms,
+    const std::string& cursor) {
+    ThreadSearchResult result;
+
+    if (search_term.empty()) {
+        result.error = "thread/search requires a search term";
+        return result;
+    }
+
+    if (limit <= 0) {
+        result.error =
+            "thread/search limit must be greater than zero";
+        return result;
+    }
+
+    nlohmann::json params = {
+        {"archived", false},
+        {"limit", limit},
+        {"searchTerm", search_term},
+        {"sortDirection", "desc"},
+        {"sortKey", "recency_at"},
+    };
+
+    if (!cursor.empty()) {
+        params["cursor"] = cursor;
+    }
+
+    auto request_result =
+        request("thread/search", params, timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "thread/search response does not contain a result object";
+        return result;
+    }
+
+    const auto& response_result =
+        result.response["result"];
+
+    if (
+        !response_result.contains("data") ||
+        !response_result["data"].is_array()
+    ) {
+        result.error =
+            "thread/search result does not contain a data array";
+        return result;
+    }
+
+    for (const auto& match : response_result["data"]) {
+        if (
+            !match.is_object() ||
+            !match.contains("thread") ||
+            !match["thread"].is_object() ||
+            !match["thread"].contains("id") ||
+            !match["thread"]["id"].is_string()
+        ) {
+            result.error =
+                "thread/search returned an invalid result";
+            return result;
+        }
+
+        result.matches.push_back(match);
+    }
+
+    if (
+        response_result.contains("nextCursor") &&
+        response_result["nextCursor"].is_string()
+    ) {
+        result.next_cursor =
+            response_result["nextCursor"]
+                .get<std::string>();
+    }
+
+    result.success = true;
+    return result;
+}
+
 AppServerClient::JsonResult AppServerClient::delete_thread(
     const std::string& thread_id,
     int timeout_ms) {
@@ -1386,6 +2134,12 @@ AppServerClient::start_turn_with_input(
     nlohmann::json params = {
         {"threadId", thread_id},
         {"input", input},
+        {
+            "additionalContext",
+            threaddeck_additional_context(
+                options.shield_enabled,
+                options.remote_shield_hosts)
+        },
     };
 
     if (!options.cwd.empty()) {
@@ -1572,7 +2326,9 @@ AppServerClient::run_streaming_turn_operation(
                 incoming_method ==
                     "item/commandExecution/requestApproval" ||
                 incoming_method ==
-                    "item/fileChange/requestApproval"
+                    "item/fileChange/requestApproval" ||
+                incoming_method ==
+                    "item/permissions/requestApproval"
             ) &&
             message.contains("id") &&
             (
@@ -1640,12 +2396,35 @@ AppServerClient::run_streaming_turn_operation(
                 decision = "decline";
             }
 
+            nlohmann::json approval_result;
+
+            if (
+                incoming_method ==
+                "item/permissions/requestApproval"
+            ) {
+                const bool approved =
+                    decision == "accept" ||
+                    decision == "acceptForSession";
+
+                approval_result = {
+                    {"permissions",
+                     approved && params.contains("permissions")
+                         ? params["permissions"]
+                         : nlohmann::json::object()},
+                    {"scope",
+                     decision == "acceptForSession"
+                         ? "session"
+                         : "turn"},
+                };
+            } else {
+                approval_result = {
+                    {"decision", decision},
+                };
+            }
+
             const nlohmann::json approval_response = {
                 {"id", approval_request.request_id},
-                {"result",
-                 {
-                     {"decision", decision},
-                 }},
+                {"result", std::move(approval_result)},
             };
 
             std::string approval_error;
@@ -2215,6 +2994,7 @@ AppServerClient::steer_turn(
              {"threadId", thread_id},
              {"expectedTurnId", expected_turn_id},
              {"input", input},
+             {"additionalContext", threaddeck_additional_context()},
          }},
     };
 
@@ -2237,25 +3017,34 @@ AppServerClient::steer_turn(
     return result;
 }
 
+void AppServerClient::cancel_pending_operation() {
+    if (stdin_fd_ >= 0) {
+        ::shutdown(stdin_fd_, SHUT_RDWR);
+    }
+
+    if (stdout_fd_ >= 0 && stdout_fd_ != stdin_fd_) {
+        ::shutdown(stdout_fd_, SHUT_RDWR);
+    }
+
+    signal_process(child_pid_, SIGTERM, true);
+    signal_process(tablet_bridge_pid_, SIGTERM, false);
+}
+
 void AppServerClient::shutdown() {
+    cancel_pending_operation();
+
+    terminate_and_reap_process(
+        tablet_bridge_pid_,
+        false);
+
     if (stdin_fd_ >= 0) {
         ::close(stdin_fd_);
         stdin_fd_ = -1;
     }
 
-    if (child_pid_ > 0) {
-        ::kill(child_pid_, SIGTERM);
-
-        int child_status = 0;
-
-        while (::waitpid(child_pid_, &child_status, 0) < 0) {
-            if (errno != EINTR) {
-                break;
-            }
-        }
-
-        child_pid_ = -1;
-    }
+    terminate_and_reap_process(
+        child_pid_,
+        true);
 
     collect_stderr();
 
@@ -2270,6 +3059,17 @@ void AppServerClient::shutdown() {
     }
 
     stdout_buffer_.clear();
+    websocket_message_buffer_.clear();
+
+    if (
+        owns_app_server_socket_ &&
+        !app_server_socket_path_.empty()
+    ) {
+        ::unlink(app_server_socket_path_.c_str());
+    }
+
+    app_server_socket_path_.clear();
+    owns_app_server_socket_ = false;
 
     {
         std::lock_guard<std::mutex> lock(
@@ -2279,7 +3079,9 @@ void AppServerClient::shutdown() {
 }
 
 bool AppServerClient::is_running() const {
-    return child_pid_ > 0;
+    return
+        stdin_fd_ >= 0 &&
+        stdout_fd_ >= 0;
 }
 
 const std::string& AppServerClient::stderr_output() const {
@@ -2299,75 +3101,239 @@ bool AppServerClient::write_line(
     std::lock_guard<std::mutex> lock(
         write_mutex_);
 
-    const std::string data = line + "\n";
-    std::size_t written = 0;
+    return write_websocket_frame(
+        0x01,
+        line,
+        error);
+}
 
-    while (written < data.size()) {
-        const ssize_t result =
-            ::write(
-                stdin_fd_,
-                data.data() + written,
-                data.size() - written);
-
-        if (result > 0) {
-            written += static_cast<std::size_t>(result);
-            continue;
-        }
-
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-
-        error = std::string("write failed: ") + std::strerror(errno);
+bool AppServerClient::write_websocket_frame(
+    std::uint8_t opcode,
+    const std::string& payload,
+    std::string& error
+) {
+    if (stdin_fd_ < 0) {
+        error = "App Server WebSocket is not connected";
         return false;
     }
 
-    return true;
+    std::array<unsigned char, 4> mask{};
+    std::random_device random;
+
+    for (auto& byte : mask) {
+        byte = static_cast<unsigned char>(random());
+    }
+
+    std::string frame;
+    frame.reserve(payload.size() + 14);
+    frame.push_back(
+        static_cast<char>(0x80U | (opcode & 0x0fU)));
+
+    const std::uint64_t payload_size =
+        static_cast<std::uint64_t>(payload.size());
+
+    if (payload_size <= 125U) {
+        frame.push_back(
+            static_cast<char>(0x80U | payload_size));
+    } else if (payload_size <= 0xffffU) {
+        frame.push_back(static_cast<char>(0x80U | 126U));
+        frame.push_back(
+            static_cast<char>((payload_size >> 8U) & 0xffU));
+        frame.push_back(
+            static_cast<char>(payload_size & 0xffU));
+    } else {
+        frame.push_back(static_cast<char>(0x80U | 127U));
+
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            frame.push_back(
+                static_cast<char>(
+                    (payload_size >> shift) & 0xffU));
+        }
+    }
+
+    for (const auto byte : mask) {
+        frame.push_back(static_cast<char>(byte));
+    }
+
+    for (std::size_t index = 0; index < payload.size(); ++index) {
+        frame.push_back(
+            static_cast<char>(
+                static_cast<unsigned char>(payload[index]) ^
+                mask[index % mask.size()]));
+    }
+
+    return send_all(
+        stdin_fd_,
+        frame.data(),
+        frame.size(),
+        error);
 }
 
 std::string AppServerClient::read_line(
     int timeout_ms,
     std::string& error) {
+    constexpr std::uint64_t maximum_message_size =
+        64ULL * 1024ULL * 1024ULL;
     const auto deadline =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms);
 
-    const auto take_buffered_line =
-        [this](std::string& line) {
-            while (true) {
-                const std::size_t newline =
-                    stdout_buffer_.find('\n');
+    while (true) {
+        if (stdout_buffer_.size() >= 2) {
+            const auto first =
+                static_cast<unsigned char>(stdout_buffer_[0]);
+            const auto second =
+                static_cast<unsigned char>(stdout_buffer_[1]);
+            const bool finished = (first & 0x80U) != 0;
+            const std::uint8_t opcode = first & 0x0fU;
+            const bool masked = (second & 0x80U) != 0;
+            std::uint64_t payload_size = second & 0x7fU;
+            std::size_t header_size = 2;
 
-                if (newline == std::string::npos) {
-                    return false;
+            if (payload_size == 126U) {
+                if (stdout_buffer_.size() < 4) {
+                    goto read_more;
                 }
 
-                line = stdout_buffer_.substr(0, newline);
-                stdout_buffer_.erase(0, newline + 1);
+                payload_size =
+                    (
+                        static_cast<std::uint64_t>(
+                            static_cast<unsigned char>(
+                                stdout_buffer_[2])) << 8U
+                    ) |
+                    static_cast<std::uint64_t>(
+                        static_cast<unsigned char>(
+                            stdout_buffer_[3]));
+                header_size = 4;
+            } else if (payload_size == 127U) {
+                if (stdout_buffer_.size() < 10) {
+                    goto read_more;
+                }
 
+                payload_size = 0;
+
+                for (std::size_t index = 2; index < 10; ++index) {
+                    payload_size =
+                        (payload_size << 8U) |
+                        static_cast<std::uint64_t>(
+                            static_cast<unsigned char>(
+                                stdout_buffer_[index]));
+                }
+
+                header_size = 10;
+            }
+
+            if (payload_size > maximum_message_size) {
+                error =
+                    "App Server WebSocket message exceeds 64 MiB";
+                return {};
+            }
+
+            std::array<unsigned char, 4> mask{};
+
+            if (masked) {
                 if (
-                    !line.empty() &&
-                    line.back() == '\r'
+                    stdout_buffer_.size() <
+                    header_size + mask.size()
                 ) {
-                    line.pop_back();
+                    goto read_more;
                 }
 
-                if (!line.empty()) {
-                    return true;
+                for (std::size_t index = 0; index < mask.size(); ++index) {
+                    mask[index] =
+                        static_cast<unsigned char>(
+                            stdout_buffer_[header_size + index]);
+                }
+
+                header_size += mask.size();
+            }
+
+            if (
+                payload_size >
+                static_cast<std::uint64_t>(
+                    std::string{}.max_size() - header_size)
+            ) {
+                error = "App Server WebSocket frame is too large";
+                return {};
+            }
+
+            const std::size_t frame_size =
+                header_size +
+                static_cast<std::size_t>(payload_size);
+
+            if (stdout_buffer_.size() < frame_size) {
+                goto read_more;
+            }
+
+            std::string payload =
+                stdout_buffer_.substr(
+                    header_size,
+                    static_cast<std::size_t>(payload_size));
+            stdout_buffer_.erase(0, frame_size);
+
+            if (masked) {
+                for (std::size_t index = 0; index < payload.size(); ++index) {
+                    payload[index] =
+                        static_cast<char>(
+                            static_cast<unsigned char>(payload[index]) ^
+                            mask[index % mask.size()]);
                 }
             }
-        };
 
-    std::string line;
+            if (opcode == 0x08U) {
+                error = "App Server closed the WebSocket";
+                return {};
+            }
 
-    if (take_buffered_line(line)) {
-        return line;
-    }
+            if (opcode == 0x09U) {
+                std::lock_guard<std::mutex> lock(
+                    write_mutex_);
 
-    while (std::chrono::steady_clock::now() < deadline) {
+                if (
+                    !write_websocket_frame(
+                        0x0a,
+                        payload,
+                        error)
+                ) {
+                    return {};
+                }
+
+                continue;
+            }
+
+            if (opcode == 0x0aU) {
+                continue;
+            }
+
+            if (opcode == 0x01U) {
+                websocket_message_buffer_ =
+                    std::move(payload);
+            } else if (opcode == 0x00U) {
+                websocket_message_buffer_ += payload;
+            } else {
+                error =
+                    "App Server sent an unsupported WebSocket frame";
+                return {};
+            }
+
+            if (finished) {
+                std::string message =
+                    std::move(websocket_message_buffer_);
+                websocket_message_buffer_.clear();
+                return message;
+            }
+
+            continue;
+        }
+
+read_more:
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now());
+
+        if (remaining.count() <= 0) {
+            return {};
+        }
 
         pollfd descriptor{
             stdout_fd_,
@@ -2390,48 +3356,46 @@ std::string AppServerClient::read_line(
                 continue;
             }
 
-            error = std::string("poll failed: ") + std::strerror(errno);
+            error =
+                std::string("WebSocket poll failed: ") +
+                std::strerror(errno);
             return {};
         }
 
-        if ((descriptor.revents & (POLLIN | POLLHUP)) == 0) {
+        if (
+            (descriptor.revents &
+             (POLLIN | POLLHUP | POLLERR)) == 0
+        ) {
             continue;
         }
 
-        char buffer[4096];
+        char buffer[16384];
         const ssize_t read_result =
-            ::read(
+            ::recv(
                 stdout_fd_,
                 buffer,
-                sizeof(buffer));
+                sizeof(buffer),
+                0);
 
         if (read_result > 0) {
             stdout_buffer_.append(
                 buffer,
-                static_cast<std::size_t>(
-                    read_result));
-
-            if (take_buffered_line(line)) {
-                return line;
-            }
-
+                static_cast<std::size_t>(read_result));
             continue;
         }
 
         if (read_result == 0) {
-            error = stdout_buffer_.empty()
-                ? "App Server closed stdout"
-                : "App Server closed stdout with an incomplete message";
+            error = "App Server closed the WebSocket";
             return {};
         }
 
         if (errno != EINTR) {
-            error = std::string("read failed: ") + std::strerror(errno);
+            error =
+                std::string("WebSocket read failed: ") +
+                std::strerror(errno);
             return {};
         }
     }
-
-    return {};
 }
 
 void AppServerClient::collect_stderr() {

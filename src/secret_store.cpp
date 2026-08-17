@@ -1,119 +1,55 @@
 #include "secret_store.h"
 
-#include <dlfcn.h>
-#include <glib.h>
+#include <libsecret/secret.h>
 
 #include <string>
 
 namespace {
 
-class SecretApi final {
-public:
-    using SchemaNew =
-        void* (*)(const char*, int, ...);
-    using SchemaUnref =
-        void (*)(void*);
-    using PasswordLookup =
-        char* (*)(const void*, void*, GError**, ...);
-    using PasswordStore =
-        gboolean (*)(
-            const void*,
-            const char*,
-            const char*,
-            const char*,
-            void*,
-            GError**,
-            ...);
-    using PasswordClear =
-        gboolean (*)(const void*, void*, GError**, ...);
-    using PasswordFree =
-        void (*)(char*);
-
-    SecretApi() {
-        library_ = dlopen(
-            "libsecret-1.so.0",
-            RTLD_NOW | RTLD_LOCAL);
-
-        if (library_ == nullptr) {
-            return;
-        }
-
-        schema_new = load<SchemaNew>("secret_schema_new");
-        schema_unref = load<SchemaUnref>("secret_schema_unref");
-        password_lookup =
-            load<PasswordLookup>("secret_password_lookup_sync");
-        password_store =
-            load<PasswordStore>("secret_password_store_sync");
-        password_clear =
-            load<PasswordClear>("secret_password_clear_sync");
-        password_free =
-            load<PasswordFree>("secret_password_free");
-    }
-
-    ~SecretApi() {
-        if (library_ != nullptr) {
-            dlclose(library_);
-        }
-    }
-
-    bool available() const {
-        return
-            library_ != nullptr &&
-            schema_new != nullptr &&
-            schema_unref != nullptr &&
-            password_lookup != nullptr &&
-            password_store != nullptr &&
-            password_clear != nullptr &&
-            password_free != nullptr;
-    }
-
-    std::string unavailable_error() const {
-        return
-            "Ubuntu Secret Service support is unavailable.";
-    }
-
-    SchemaNew schema_new{nullptr};
-    SchemaUnref schema_unref{nullptr};
-    PasswordLookup password_lookup{nullptr};
-    PasswordStore password_store{nullptr};
-    PasswordClear password_clear{nullptr};
-    PasswordFree password_free{nullptr};
-
-private:
-    template<typename Function>
-    Function load(const char* name) {
-        return reinterpret_cast<Function>(
-            dlsym(library_, name));
-    }
-
-    void* library_{nullptr};
+const SecretSchema kSplunkSchema = {
+    "com.ronpatrick.ThreadDeck.Splunk",
+    SECRET_SCHEMA_NONE,
+    {
+        {
+            "account",
+            SECRET_SCHEMA_ATTRIBUTE_STRING,
+        },
+        {
+            nullptr,
+            SECRET_SCHEMA_ATTRIBUTE_STRING,
+        },
+    },
+    0,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
-class SplunkSchema final {
-public:
-    explicit SplunkSchema(SecretApi& api)
-        : api_(api) {
-        schema_ = api_.schema_new(
-            "com.ronpatrick.ThreadDeck.Splunk",
-            0,
-            "account",
-            0,
-            nullptr);
-    }
-
-    ~SplunkSchema() {
-        if (schema_ != nullptr) {
-            api_.schema_unref(schema_);
-        }
-    }
-
-    const void* get() const {
-        return schema_;
-    }
-
-private:
-    SecretApi& api_;
-    void* schema_{nullptr};
+const SecretSchema kRemoteSudoSchema = {
+    "com.ronpatrick.ThreadDeck.RemoteSudo",
+    SECRET_SCHEMA_NONE,
+    {
+        {
+            "host",
+            SECRET_SCHEMA_ATTRIBUTE_STRING,
+        },
+        {
+            nullptr,
+            SECRET_SCHEMA_ATTRIBUTE_STRING,
+        },
+    },
+    0,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 std::string consume_error(GError* error) {
@@ -138,23 +74,9 @@ bool SecretStore::load_splunk_token(
     token.clear();
     error.clear();
 
-    SecretApi api;
-
-    if (!api.available()) {
-        error = api.unavailable_error();
-        return false;
-    }
-
-    SplunkSchema schema(api);
-
-    if (schema.get() == nullptr) {
-        error = "Could not create the Splunk keyring schema.";
-        return false;
-    }
-
     GError* keyring_error = nullptr;
-    char* password = api.password_lookup(
-        schema.get(),
+    char* password = secret_password_lookup_sync(
+        &kSplunkSchema,
         nullptr,
         &keyring_error,
         "account",
@@ -168,7 +90,7 @@ bool SecretStore::load_splunk_token(
 
     if (password != nullptr) {
         token = password;
-        api.password_free(password);
+        secret_password_free(password);
     }
 
     return true;
@@ -184,24 +106,10 @@ bool SecretStore::save_splunk_token(
         return false;
     }
 
-    SecretApi api;
-
-    if (!api.available()) {
-        error = api.unavailable_error();
-        return false;
-    }
-
-    SplunkSchema schema(api);
-
-    if (schema.get() == nullptr) {
-        error = "Could not create the Splunk keyring schema.";
-        return false;
-    }
-
     GError* keyring_error = nullptr;
-    const gboolean stored = api.password_store(
-        schema.get(),
-        nullptr,
+    const gboolean stored = secret_password_store_sync(
+        &kSplunkSchema,
+        SECRET_COLLECTION_DEFAULT,
         "ThreadDeck Splunk token",
         token.c_str(),
         nullptr,
@@ -222,27 +130,113 @@ bool SecretStore::clear_splunk_token(
     std::string& error) {
     error.clear();
 
-    SecretApi api;
-
-    if (!api.available()) {
-        error = api.unavailable_error();
-        return false;
-    }
-
-    SplunkSchema schema(api);
-
-    if (schema.get() == nullptr) {
-        error = "Could not create the Splunk keyring schema.";
-        return false;
-    }
-
     GError* keyring_error = nullptr;
-    const gboolean cleared = api.password_clear(
-        schema.get(),
+    const gboolean cleared = secret_password_clear_sync(
+        &kSplunkSchema,
         nullptr,
         &keyring_error,
         "account",
         "default",
+        nullptr);
+
+    if (!cleared && keyring_error != nullptr) {
+        error = consume_error(keyring_error);
+        return false;
+    }
+
+    return true;
+}
+
+bool SecretStore::load_remote_sudo_password(
+    const std::string& host_identity,
+    std::string& password,
+    std::string& error) {
+    password.clear();
+    error.clear();
+
+    if (host_identity.empty()) {
+        error = "The remote host identity is empty.";
+        return false;
+    }
+
+    GError* keyring_error = nullptr;
+    char* stored = secret_password_lookup_sync(
+        &kRemoteSudoSchema,
+        nullptr,
+        &keyring_error,
+        "host",
+        host_identity.c_str(),
+        nullptr);
+
+    if (keyring_error != nullptr) {
+        error = consume_error(keyring_error);
+        return false;
+    }
+
+    if (stored != nullptr) {
+        password = stored;
+        secret_password_free(stored);
+    }
+
+    return true;
+}
+
+bool SecretStore::save_remote_sudo_password(
+    const std::string& host_identity,
+    const std::string& password,
+    std::string& error) {
+    error.clear();
+
+    if (host_identity.empty()) {
+        error = "The remote host identity is empty.";
+        return false;
+    }
+
+    if (password.empty()) {
+        error = "The remote sudo password is empty.";
+        return false;
+    }
+
+    const std::string label =
+        "ThreadDeck remote sudo password for " +
+        host_identity;
+    GError* keyring_error = nullptr;
+    const gboolean stored = secret_password_store_sync(
+        &kRemoteSudoSchema,
+        SECRET_COLLECTION_DEFAULT,
+        label.c_str(),
+        password.c_str(),
+        nullptr,
+        &keyring_error,
+        "host",
+        host_identity.c_str(),
+        nullptr);
+
+    if (!stored) {
+        error = consume_error(keyring_error);
+        return false;
+    }
+
+    return true;
+}
+
+bool SecretStore::clear_remote_sudo_password(
+    const std::string& host_identity,
+    std::string& error) {
+    error.clear();
+
+    if (host_identity.empty()) {
+        error = "The remote host identity is empty.";
+        return false;
+    }
+
+    GError* keyring_error = nullptr;
+    const gboolean cleared = secret_password_clear_sync(
+        &kRemoteSudoSchema,
+        nullptr,
+        &keyring_error,
+        "host",
+        host_identity.c_str(),
         nullptr);
 
     if (!cleared && keyring_error != nullptr) {
