@@ -1,11 +1,11 @@
 [Unit]
-Description=ThreadDeck tablet loopback bridge
+Description=ThreadDeck tablet private-network bridge
 After=threaddeck-tablet-host.service
 
 [Service]
 Type=simple
 WorkingDirectory=/var/www/CodexNativeUbuntu
-ExecStart=/var/www/CodexNativeUbuntu/build/threaddeck-tablet-bridge --socket %t/threaddeck/app-server.sock --port 4545
+ExecStart=/var/www/CodexNativeUbuntu/build/threaddeck-tablet-bridge --socket %t/threaddeck/app-server.sock --port 4545 --bind 10.77.0.1 --allow-client 10.77.0.3
 Restart=always
 RestartSec=2
 

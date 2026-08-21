@@ -2,11 +2,14 @@
 #include "context_panel.h"
 #include "secret_store.h"
 #include "thread_header.h"
+#include "thread_search_index.h"
 
 #include <nlohmann/json.hpp>
 
 #include <glib.h>
 #include <giomm/appinfo.h>
+#include <giomm/file.h>
+#include <giomm/filemonitor.h>
 #include <giomm/menu.h>
 #include <giomm/simpleaction.h>
 #include <gdk/gdkkeysyms.h>
@@ -17,6 +20,7 @@
 #include <glibmm/dispatcher.h>
 #include <glibmm/convert.h>
 #include <glibmm/main.h>
+#include <glibmm/markup.h>
 #include <glibmm/miscutils.h>
 #include <gtkmm/aboutdialog.h>
 #include <gtkmm/application.h>
@@ -234,6 +238,16 @@ public:
             const std::string&,
             bool,
             std::string&)>;
+    using SkillsRefreshHandler =
+        std::function<void()>;
+    using SkillEnableHandler =
+        std::function<void(
+            const std::string&,
+            bool)>;
+    using SkillInstallHandler =
+        std::function<bool(
+            const std::string&,
+            std::string&)>;
 
     explicit SettingsWindow(
         Gtk::ComboBoxText& theme_selector
@@ -242,6 +256,11 @@ public:
           appearance_page_(Gtk::ORIENTATION_VERTICAL),
           splunk_page_(Gtk::ORIENTATION_VERTICAL),
           splunk_actions_(Gtk::ORIENTATION_HORIZONTAL),
+          skills_page_(Gtk::ORIENTATION_VERTICAL),
+          skills_toolbar_(Gtk::ORIENTATION_HORIZONTAL),
+          skills_list_(Gtk::ORIENTATION_VERTICAL),
+          skill_detail_(Gtk::ORIENTATION_VERTICAL),
+          skill_detail_actions_(Gtk::ORIENTATION_HORIZONTAL),
           theme_selector_(theme_selector),
           appearance_title_("Appearance"),
           theme_label_("Theme"),
@@ -258,9 +277,21 @@ public:
           splunk_token_label_("Splunk token"),
           splunk_status_("No Splunk token is saved."),
           splunk_save_button_("Save"),
-          splunk_remove_button_("Remove") {
+          splunk_remove_button_("Remove"),
+          skills_title_("Skills"),
+          skills_description_(
+              "Enabled Codex workflows available to the active project. "
+              "Select a skill to inspect its complete instructions."),
+          skills_project_("No active project."),
+          skills_refresh_button_("Refresh"),
+          skills_install_button_("Install…"),
+          skill_detail_title_("Select a skill"),
+          skill_detail_description_(""),
+          skill_detail_metadata_(""),
+          skill_enabled_("Enabled"),
+          skills_status_("") {
         set_title("ThreadDeck Settings");
-        set_default_size(620, 420);
+        set_default_size(980, 650);
         set_modal(false);
 
         root_.get_style_context()->add_class(
@@ -397,6 +428,155 @@ public:
             "splunk",
             "Splunk");
 
+        skills_page_.get_style_context()->add_class(
+            "settings-page");
+        skills_page_.set_border_width(22);
+        skills_page_.set_spacing(10);
+
+        skills_title_.set_xalign(0.0F);
+        skills_title_.set_markup(
+            "<span size=\"x-large\" weight=\"bold\">"
+            "Skills"
+            "</span>");
+        skills_description_.set_xalign(0.0F);
+        skills_description_.set_line_wrap(true);
+        skills_project_.set_xalign(0.0F);
+        skills_project_.get_style_context()->add_class(
+            "dim-label");
+
+        skills_search_.set_placeholder_text(
+            "Search skills");
+        skills_search_.set_hexpand(true);
+        skills_search_.signal_search_changed().connect(
+            sigc::mem_fun(
+                *this,
+                &SettingsWindow::rebuild_skills_list));
+
+        skills_refresh_button_.signal_clicked().connect(
+            [this]() {
+                skills_status_.set_text(
+                    "Refreshing skills…");
+                if (skills_refresh_handler_) {
+                    skills_refresh_handler_();
+                }
+            });
+        skills_install_button_.signal_clicked().connect(
+            sigc::mem_fun(
+                *this,
+                &SettingsWindow::install_skill));
+
+        skills_toolbar_.set_spacing(8);
+        skills_toolbar_.pack_start(
+            skills_search_,
+            Gtk::PACK_EXPAND_WIDGET);
+        skills_toolbar_.pack_start(
+            skills_refresh_button_,
+            Gtk::PACK_SHRINK);
+        skills_toolbar_.pack_start(
+            skills_install_button_,
+            Gtk::PACK_SHRINK);
+
+        skills_list_scroll_.set_policy(
+            Gtk::POLICY_NEVER,
+            Gtk::POLICY_AUTOMATIC);
+        skills_list_scroll_.set_shadow_type(
+            Gtk::SHADOW_IN);
+        skills_list_scroll_.set_size_request(
+            270,
+            -1);
+        skills_list_.set_spacing(4);
+        skills_list_.set_border_width(6);
+        skills_list_scroll_.add(skills_list_);
+
+        skill_detail_title_.set_xalign(0.0F);
+        skill_detail_title_.set_line_wrap(true);
+        skill_detail_title_.set_markup(
+            "<b>Select a skill</b>");
+        skill_detail_description_.set_xalign(0.0F);
+        skill_detail_description_.set_line_wrap(true);
+        skill_detail_metadata_.set_xalign(0.0F);
+        skill_detail_metadata_.set_line_wrap(true);
+        skill_detail_metadata_.set_selectable(true);
+        skill_detail_metadata_.get_style_context()->add_class(
+            "dim-label");
+
+        skill_enabled_.signal_toggled().connect(
+            sigc::mem_fun(
+                *this,
+                &SettingsWindow::toggle_selected_skill));
+        skill_detail_actions_.set_spacing(8);
+        skill_detail_actions_.pack_start(
+            skill_enabled_,
+            Gtk::PACK_SHRINK);
+
+        skill_content_.set_editable(false);
+        skill_content_.set_cursor_visible(false);
+        skill_content_.set_monospace(true);
+        skill_content_.set_wrap_mode(Gtk::WRAP_WORD_CHAR);
+        skill_content_scroll_.set_policy(
+            Gtk::POLICY_AUTOMATIC,
+            Gtk::POLICY_AUTOMATIC);
+        skill_content_scroll_.set_shadow_type(
+            Gtk::SHADOW_IN);
+        skill_content_scroll_.add(skill_content_);
+
+        skill_detail_.set_spacing(8);
+        skill_detail_.set_border_width(8);
+        skill_detail_.pack_start(
+            skill_detail_title_,
+            Gtk::PACK_SHRINK);
+        skill_detail_.pack_start(
+            skill_detail_description_,
+            Gtk::PACK_SHRINK);
+        skill_detail_.pack_start(
+            skill_detail_metadata_,
+            Gtk::PACK_SHRINK);
+        skill_detail_.pack_start(
+            skill_detail_actions_,
+            Gtk::PACK_SHRINK);
+        skill_detail_.pack_start(
+            skill_content_scroll_,
+            Gtk::PACK_EXPAND_WIDGET);
+
+        skills_body_.pack1(
+            skills_list_scroll_,
+            false,
+            false);
+        skills_body_.pack2(
+            skill_detail_,
+            true,
+            false);
+        skills_body_.set_position(290);
+
+        skills_status_.set_xalign(0.0F);
+        skills_status_.set_line_wrap(true);
+        skills_status_.get_style_context()->add_class(
+            "dim-label");
+
+        skills_page_.pack_start(
+            skills_title_,
+            Gtk::PACK_SHRINK);
+        skills_page_.pack_start(
+            skills_description_,
+            Gtk::PACK_SHRINK);
+        skills_page_.pack_start(
+            skills_project_,
+            Gtk::PACK_SHRINK);
+        skills_page_.pack_start(
+            skills_toolbar_,
+            Gtk::PACK_SHRINK);
+        skills_page_.pack_start(
+            skills_body_,
+            Gtk::PACK_EXPAND_WIDGET);
+        skills_page_.pack_start(
+            skills_status_,
+            Gtk::PACK_SHRINK);
+
+        settings_stack_.add(
+            skills_page_,
+            "skills",
+            "Skills");
+
         root_.pack_start(
             category_sidebar_,
             Gtk::PACK_SHRINK);
@@ -421,6 +601,77 @@ public:
         splunk_save_handler_ = std::move(handler);
     }
 
+    void set_skills_refresh_handler(
+        SkillsRefreshHandler handler
+    ) {
+        skills_refresh_handler_ =
+            std::move(handler);
+    }
+
+    void set_skill_enable_handler(
+        SkillEnableHandler handler
+    ) {
+        skill_enable_handler_ =
+            std::move(handler);
+    }
+
+    void set_skill_install_handler(
+        SkillInstallHandler handler
+    ) {
+        skill_install_handler_ =
+            std::move(handler);
+    }
+
+    void set_skills(
+        const std::string& cwd,
+        const std::vector<nlohmann::json>& skills,
+        const std::string& error = {}
+    ) {
+        skills_cwd_ = cwd;
+        skills_ = skills;
+        skills_project_.set_text(
+            cwd.empty()
+                ? "No active project."
+                : "Active project: " + cwd);
+        skills_status_.set_text(
+            !error.empty()
+                ? error
+                : std::to_string(skills.size()) +
+                    " skill(s) discovered by Codex.");
+
+        if (!selected_skill_path_.empty()) {
+            const auto selected = std::find_if(
+                skills_.begin(),
+                skills_.end(),
+                [this](const nlohmann::json& skill) {
+                    return skill.value(
+                        "path",
+                        std::string{}) ==
+                        selected_skill_path_;
+                });
+
+            if (selected == skills_.end()) {
+                selected_skill_path_.clear();
+            }
+        }
+
+        rebuild_skills_list();
+
+        if (selected_skill_path_.empty()) {
+            clear_skill_detail();
+        } else {
+            select_skill(selected_skill_path_);
+        }
+    }
+
+    void set_skill_operation_result(
+        const std::string& message
+    ) {
+        skills_status_.set_text(message);
+        skill_enabled_.set_sensitive(
+            !selected_skill_path_.empty());
+    }
+
     void present_for(
         Gtk::Window& parent,
         const std::string& splunk_host,
@@ -440,6 +691,329 @@ public:
     }
 
 private:
+    static std::string skill_display_name(
+        const nlohmann::json& skill
+    ) {
+        if (
+            skill.contains("interface") &&
+            skill["interface"].is_object()
+        ) {
+            const std::string display_name =
+                skill["interface"].value(
+                    "displayName",
+                    std::string{});
+
+            if (!display_name.empty()) {
+                return display_name;
+            }
+        }
+
+        return skill.value(
+            "name",
+            std::string{"Unnamed skill"});
+    }
+
+    static std::string skill_description(
+        const nlohmann::json& skill
+    ) {
+        if (
+            skill.contains("interface") &&
+            skill["interface"].is_object()
+        ) {
+            const std::string short_description =
+                skill["interface"].value(
+                    "shortDescription",
+                    std::string{});
+
+            if (!short_description.empty()) {
+                return short_description;
+            }
+        }
+
+        const std::string short_description =
+            skill.value(
+                "shortDescription",
+                std::string{});
+
+        return short_description.empty()
+            ? skill.value(
+                "description",
+                std::string{})
+            : short_description;
+    }
+
+    static std::string lowercase_skill_text(
+        std::string value
+    ) {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char character) {
+                return static_cast<char>(
+                    std::tolower(character));
+            });
+        return value;
+    }
+
+    void rebuild_skills_list() {
+        const auto children =
+            skills_list_.get_children();
+
+        for (auto* child : children) {
+            if (child != nullptr) {
+                skills_list_.remove(*child);
+            }
+        }
+
+        const std::string query =
+            lowercase_skill_text(
+                skills_search_.get_text().raw());
+
+        std::size_t shown = 0;
+
+        for (const auto& skill : skills_) {
+            const std::string path =
+                skill.value(
+                    "path",
+                    std::string{});
+            const std::string name =
+                skill_display_name(skill);
+            const std::string description =
+                skill_description(skill);
+            const std::string scope =
+                skill.value(
+                    "scope",
+                    std::string{"unknown"});
+            const bool enabled =
+                skill.value("enabled", false);
+            const std::string searchable =
+                lowercase_skill_text(
+                    name + " " + description + " " + scope);
+
+            if (
+                path.empty() ||
+                (
+                    !query.empty() &&
+                    searchable.find(query) ==
+                        std::string::npos
+                )
+            ) {
+                continue;
+            }
+
+            auto* button = Gtk::manage(
+                new Gtk::Button(
+                    name + "\n" +
+                    scope + " · " +
+                    (enabled ? "Enabled" : "Disabled")));
+            button->set_alignment(0.0F, 0.5F);
+            button->set_relief(Gtk::RELIEF_NONE);
+            button->set_tooltip_text(description);
+            button->get_style_context()->add_class(
+                "skill-manager-row");
+            button->signal_clicked().connect(
+                [this, path]() {
+                    select_skill(path);
+                });
+            skills_list_.pack_start(
+                *button,
+                Gtk::PACK_SHRINK);
+            ++shown;
+        }
+
+        if (shown == 0) {
+            auto* empty = Gtk::manage(
+                new Gtk::Label(
+                    skills_.empty()
+                        ? "No skills discovered."
+                        : "No matching skills."));
+            empty->set_xalign(0.0F);
+            empty->set_line_wrap(true);
+            empty->get_style_context()->add_class(
+                "dim-label");
+            skills_list_.pack_start(
+                *empty,
+                Gtk::PACK_SHRINK);
+        }
+
+        skills_list_.show_all_children();
+    }
+
+    void clear_skill_detail() {
+        selected_skill_path_.clear();
+        skill_detail_updating_ = true;
+        skill_detail_title_.set_markup(
+            "<b>Select a skill</b>");
+        skill_detail_description_.set_text("");
+        skill_detail_metadata_.set_text("");
+        skill_enabled_.set_active(false);
+        skill_enabled_.set_sensitive(false);
+        skill_content_.get_buffer()->set_text("");
+        skill_detail_updating_ = false;
+    }
+
+    void select_skill(
+        const std::string& path
+    ) {
+        const auto selected = std::find_if(
+            skills_.begin(),
+            skills_.end(),
+            [&path](const nlohmann::json& skill) {
+                return skill.value(
+                    "path",
+                    std::string{}) == path;
+            });
+
+        if (selected == skills_.end()) {
+            clear_skill_detail();
+            return;
+        }
+
+        selected_skill_path_ = path;
+        const std::string name =
+            skill_display_name(*selected);
+        const std::string description =
+            skill_description(*selected);
+        const std::string scope =
+            selected->value(
+                "scope",
+                std::string{"unknown"});
+
+        skill_detail_title_.set_markup(
+            "<b>" +
+            Glib::Markup::escape_text(name) +
+            "</b>");
+        skill_detail_description_.set_text(
+            description);
+
+        std::string metadata =
+            "Scope: " + scope +
+            "\nPath: " + path;
+
+        if (
+            selected->contains("dependencies") &&
+            !(*selected)["dependencies"].is_null()
+        ) {
+            metadata +=
+                "\nDependencies:\n" +
+                (*selected)["dependencies"].dump(2);
+        }
+
+        skill_detail_metadata_.set_text(metadata);
+
+        skill_detail_updating_ = true;
+        skill_enabled_.set_active(
+            selected->value("enabled", false));
+        skill_enabled_.set_sensitive(true);
+        skill_detail_updating_ = false;
+
+        std::ifstream input(path);
+        std::ostringstream contents;
+
+        if (input) {
+            contents << input.rdbuf();
+            skill_content_.get_buffer()->set_text(
+                contents.str());
+        } else {
+            skill_content_.get_buffer()->set_text(
+                "ThreadDeck could not read this skill file.");
+        }
+    }
+
+    void toggle_selected_skill() {
+        if (
+            skill_detail_updating_ ||
+            selected_skill_path_.empty() ||
+            !skill_enable_handler_
+        ) {
+            return;
+        }
+
+        skill_enabled_.set_sensitive(false);
+        skills_status_.set_text(
+            skill_enabled_.get_active()
+                ? "Enabling skill…"
+                : "Disabling skill…");
+        skill_enable_handler_(
+            selected_skill_path_,
+            skill_enabled_.get_active());
+    }
+
+    void install_skill() {
+        Gtk::Dialog dialog(
+            "Install a Codex skill",
+            *this,
+            true);
+        dialog.set_default_size(560, -1);
+
+        Gtk::Label explanation(
+            "Enter a curated skill name or a GitHub repository/path. "
+            "ThreadDeck will invoke Codex's built-in skill-installer "
+            "workflow in the active thread.");
+        explanation.set_xalign(0.0F);
+        explanation.set_line_wrap(true);
+
+        Gtk::Entry source;
+        source.set_placeholder_text(
+            "linear or owner/repository/path/to/skill");
+        source.set_activates_default(true);
+
+        auto* content = dialog.get_content_area();
+        content->set_spacing(10);
+        content->set_border_width(12);
+        content->pack_start(
+            explanation,
+            Gtk::PACK_SHRINK);
+        content->pack_start(
+            source,
+            Gtk::PACK_SHRINK);
+
+        dialog.add_button(
+            "_Cancel",
+            Gtk::RESPONSE_CANCEL);
+        dialog.add_button(
+            "_Install",
+            Gtk::RESPONSE_OK);
+        dialog.set_default_response(
+            Gtk::RESPONSE_OK);
+        dialog.show_all_children();
+
+        if (dialog.run() != Gtk::RESPONSE_OK) {
+            return;
+        }
+
+        const std::string requested =
+            source.get_text().raw();
+        std::string error;
+
+        if (
+            requested.empty() ||
+            !skill_install_handler_ ||
+            !skill_install_handler_(
+                requested,
+                error)
+        ) {
+            Gtk::MessageDialog failure(
+                *this,
+                "The skill installation could not be started.",
+                false,
+                Gtk::MESSAGE_ERROR,
+                Gtk::BUTTONS_OK,
+                true);
+            failure.set_secondary_text(
+                error.empty()
+                    ? "Enter a skill name or repository path."
+                    : error);
+            failure.run();
+            return;
+        }
+
+        skills_status_.set_text(
+            "The skill-installer workflow started in the active thread.");
+        hide();
+    }
+
     void show_splunk_error(
         const std::string& error
     ) {
@@ -531,6 +1105,12 @@ private:
     Gtk::Box appearance_page_;
     Gtk::Box splunk_page_;
     Gtk::Box splunk_actions_;
+    Gtk::Box skills_page_;
+    Gtk::Box skills_toolbar_;
+    Gtk::Paned skills_body_{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Box skills_list_;
+    Gtk::Box skill_detail_;
+    Gtk::Box skill_detail_actions_;
 
     Gtk::ComboBoxText& theme_selector_;
 
@@ -546,7 +1126,29 @@ private:
     Gtk::Label splunk_status_;
     Gtk::Button splunk_save_button_;
     Gtk::Button splunk_remove_button_;
+    Gtk::Label skills_title_;
+    Gtk::Label skills_description_;
+    Gtk::Label skills_project_;
+    Gtk::SearchEntry skills_search_;
+    Gtk::Button skills_refresh_button_;
+    Gtk::Button skills_install_button_;
+    Gtk::ScrolledWindow skills_list_scroll_;
+    Gtk::Label skill_detail_title_;
+    Gtk::Label skill_detail_description_;
+    Gtk::Label skill_detail_metadata_;
+    Gtk::CheckButton skill_enabled_;
+    Gtk::ScrolledWindow skill_content_scroll_;
+    Gtk::TextView skill_content_;
+    Gtk::Label skills_status_;
+
     SplunkSaveHandler splunk_save_handler_;
+    SkillsRefreshHandler skills_refresh_handler_;
+    SkillEnableHandler skill_enable_handler_;
+    SkillInstallHandler skill_install_handler_;
+    std::string skills_cwd_;
+    std::vector<nlohmann::json> skills_;
+    std::string selected_skill_path_;
+    bool skill_detail_updating_{false};
 };
 
 class AgentsEditorWindow final : public Gtk::Window {
@@ -1552,6 +2154,29 @@ public:
                     error);
             });
 
+        settings_window_.set_skills_refresh_handler(
+            [this]() {
+                refresh_active_skills();
+            });
+        settings_window_.set_skill_enable_handler(
+            [this](
+                const std::string& path,
+                bool enabled
+            ) {
+                set_skill_enabled_async(
+                    path,
+                    enabled);
+            });
+        settings_window_.set_skill_install_handler(
+            [this](
+                const std::string& source,
+                std::string& error
+            ) {
+                return start_skill_installation(
+                    source,
+                    error);
+            });
+
         folder_button_.signal_clicked().connect(
             sigc::mem_fun(*this, &MainWindow::select_folder));
 
@@ -1569,6 +2194,11 @@ public:
             sigc::mem_fun(
                 *this,
                 &MainWindow::handle_auto_copy_toggled));
+
+        skill_button_.signal_clicked().connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::show_skill_picker));
 
         pause_button_.signal_clicked().connect(
             sigc::mem_fun(
@@ -1659,6 +2289,11 @@ public:
                 *this,
                 &MainWindow::handle_skill_load_finished));
 
+        skill_config_dispatcher_.connect(
+            sigc::mem_fun(
+                *this,
+                &MainWindow::handle_skill_config_finished));
+
         shield_dispatcher_.connect(
             sigc::mem_fun(
                 *this,
@@ -1709,6 +2344,13 @@ public:
                 &MainWindow::handle_prompt_text_inserted),
             true);
 
+        skill_search_.signal_search_changed().connect(
+            [this]() {
+                if (skill_picker_search_active_) {
+                    update_skill_suggestions(true);
+                }
+            });
+
         const std::vector<Gtk::TargetEntry>
             composer_drop_targets = {
                 Gtk::TargetEntry("text/uri-list"),
@@ -1739,9 +2381,43 @@ public:
                 &MainWindow::handle_thread_search_changed));
 
         skill_popover_.set_relative_to(prompt_);
+        skill_popover_content_.set_spacing(6);
+        skill_search_.set_placeholder_text(
+            "Search skills");
+        skill_search_.set_hexpand(true);
         skill_suggestions_.set_spacing(2);
         skill_suggestions_.set_border_width(6);
-        skill_popover_.add(skill_suggestions_);
+        skill_suggestions_scroll_.set_policy(
+            Gtk::POLICY_NEVER,
+            Gtk::POLICY_AUTOMATIC);
+        skill_suggestions_scroll_.set_shadow_type(
+            Gtk::SHADOW_NONE);
+        skill_suggestions_scroll_.add(
+            skill_suggestions_);
+        skill_popover_content_.pack_start(
+            skill_search_,
+            Gtk::PACK_SHRINK);
+        skill_popover_content_.pack_start(
+            skill_suggestions_scroll_,
+            Gtk::PACK_EXPAND_WIDGET);
+        skill_popover_.add(skill_popover_content_);
+        skill_popover_.signal_closed().connect(
+            [this]() {
+                skill_picker_search_active_ = false;
+            });
+        skill_search_.hide();
+
+        skill_image_.set_from_icon_name(
+            "system-run-symbolic",
+            Gtk::ICON_SIZE_BUTTON);
+        skill_button_.set_image(skill_image_);
+        skill_button_.set_always_show_image(true);
+        skill_button_.set_relief(Gtk::RELIEF_NONE);
+        skill_button_.set_size_request(42, 42);
+        skill_button_.set_valign(Gtk::ALIGN_END);
+        skill_button_.set_tooltip_text(
+            "Choose a Codex skill");
+        skill_button_.set_sensitive(false);
 
         new_thread_button_.set_sensitive(false);
         send_button_.set_sensitive(false);
@@ -1839,6 +2515,14 @@ public:
         session_controls_.set_valign(Gtk::ALIGN_CENTER);
         session_controls_.get_style_context()->add_class(
             "session-controls");
+
+        session_controls_scroll_.set_policy(
+            Gtk::POLICY_AUTOMATIC,
+            Gtk::POLICY_NEVER);
+        session_controls_scroll_.set_overlay_scrolling(false);
+        session_controls_scroll_.set_shadow_type(
+            Gtk::SHADOW_NONE);
+        session_controls_scroll_.add(session_controls_);
 
         session_controls_.pack_start(
             model_label_,
@@ -2013,6 +2697,7 @@ public:
         remote_shield_icon_.show();
         remote_shield_button_.set_relief(Gtk::RELIEF_NONE);
         remote_shield_button_.set_size_request(42, 36);
+        remote_shield_button_.set_can_focus(false);
         remote_shield_button_.get_style_context()->add_class(
             "compact-header-button");
         remote_shield_button_.get_style_context()->add_class(
@@ -2194,6 +2879,9 @@ public:
 
         transcript_.set_editable(false);
         transcript_.set_wrap_mode(Gtk::WRAP_WORD_CHAR);
+        transcript_scroll_.set_policy(
+            Gtk::POLICY_NEVER,
+            Gtk::POLICY_AUTOMATIC);
         transcript_.add_events(
             Gdk::POINTER_MOTION_MASK |
             Gdk::LEAVE_NOTIFY_MASK);
@@ -2251,6 +2939,13 @@ public:
                     sigc::mem_fun(
                         *this,
                         &MainWindow::handle_transcript_scroll_changed));
+
+            transcript_adjustment
+                ->signal_changed()
+                .connect(
+                    sigc::mem_fun(
+                        *this,
+                        &MainWindow::handle_transcript_extent_changed));
         }
 
         prompt_.get_buffer()->set_text("");
@@ -2330,7 +3025,7 @@ public:
             thread_header_,
             Gtk::PACK_SHRINK);
         content_.pack_start(
-            session_controls_,
+            session_controls_scroll_,
             Gtk::PACK_SHRINK);
         content_.pack_start(
             transcript_overlay_,
@@ -2338,6 +3033,9 @@ public:
 
         composer_.set_spacing(8);
         composer_.get_style_context()->add_class("composer");
+        composer_.pack_start(
+            skill_button_,
+            Gtk::PACK_SHRINK);
         composer_.pack_start(
             attachment_button_,
             Gtk::PACK_SHRINK);
@@ -2366,7 +3064,7 @@ public:
             composer_area_,
             Gtk::PACK_SHRINK);
 
-        workspace_.pack1(content_, true, false);
+        workspace_.pack1(content_, true, true);
         workspace_.pack2(context_panel_, false, true);
         workspace_.set_position(620);
 
@@ -2418,7 +3116,7 @@ public:
             true);
 
         body_.pack1(sidebar_, false, true);
-        body_.pack2(main_workspace_, true, false);
+        body_.pack2(main_workspace_, true, true);
         body_.set_position(260);
 
         root_.pack_start(body_, Gtk::PACK_EXPAND_WIDGET);
@@ -2581,6 +3279,14 @@ public:
             }
         }
 
+        if (skill_config_worker_.joinable()) {
+            skill_config_worker_.join();
+        }
+
+        if (skill_refresh_timeout_connection_.connected()) {
+            skill_refresh_timeout_connection_.disconnect();
+        }
+
         if (shield_worker_.joinable()) {
             shield_worker_.join();
         }
@@ -2601,6 +3307,33 @@ public:
 private:
 public:
     void show_settings() {
+        const std::string cwd =
+            !last_active_thread_cwd_.empty()
+                ? last_active_thread_cwd_
+                : selected_folder_path_;
+        const auto cached =
+            all_skill_catalog_by_cwd_.find(cwd);
+
+        if (cwd.empty()) {
+            settings_window_.set_skills(
+                {},
+                {},
+                "Select a project or thread to manage its skills.");
+        } else if (
+            cached !=
+            all_skill_catalog_by_cwd_.end()
+        ) {
+            settings_window_.set_skills(
+                cwd,
+                cached->second);
+        } else {
+            settings_window_.set_skills(
+                cwd,
+                {},
+                "Loading skills from Codex…");
+            load_skills_for_cwd(cwd);
+        }
+
         settings_window_.present_for(
             *this,
             splunk_host_,
@@ -4061,6 +4794,33 @@ private:
             ".threaddeck-ui-state.json");
     }
 
+    std::filesystem::path thread_search_index_path() const {
+        const char* xdg_data_home =
+            std::getenv("XDG_DATA_HOME");
+
+        if (
+            xdg_data_home != nullptr &&
+            *xdg_data_home != '\0'
+        ) {
+            return std::filesystem::path(
+                xdg_data_home
+            ) / "threaddeck" / "thread-search.sqlite3";
+        }
+
+        const char* home = std::getenv("HOME");
+
+        if (home != nullptr && *home != '\0') {
+            return std::filesystem::path(
+                home
+            ) / ".local" / "share" /
+                "threaddeck" /
+                "thread-search.sqlite3";
+        }
+
+        return std::filesystem::path(
+            ".threaddeck-thread-search.sqlite3");
+    }
+
     AppServerClient::ProcessEnvironment
     current_codex_process_environment() const {
         AppServerClient::ProcessEnvironment environment;
@@ -4851,6 +5611,7 @@ private:
                         180,
                         allocated_width - 310));
             }
+
         } else {
             remote_hosts_panel_.hide();
         }
@@ -6842,6 +7603,15 @@ headerbar.threaddeck-header {
     background-color: @theme_bg_color;
 }
 
+.skill-manager-row {
+    padding: 8px;
+    border-radius: 7px;
+}
+
+.skill-manager-row:hover {
+    background-color: alpha(@theme_fg_color, 0.08);
+}
+
 .context-strip {
     background-color: shade(@theme_bg_color, 0.98);
     border-bottom: 1px solid alpha(@theme_fg_color, 0.10);
@@ -7083,6 +7853,11 @@ button.approval-danger-button {
 
 .thread-row.completed-thread:hover {
     background-color: rgba(55, 158, 91, 0.24);
+}
+
+.thread-search-snippet {
+    color: alpha(@theme_fg_color, 0.72);
+    font-size: 0.88em;
 }
 
 .working-spinner {
@@ -9102,7 +9877,8 @@ button.approval-danger-button {
     }
 
     void load_skills_for_cwd(
-        const std::string& cwd
+        const std::string& cwd,
+        bool force_reload = false
     ) {
         clear_skill_suggestions();
         skill_popover_.popdown();
@@ -9116,24 +9892,35 @@ button.approval-danger-button {
             return;
         }
 
-        if (skill_catalog_cwd_ == cwd) {
+        if (
+            !force_reload &&
+            skill_catalog_cwd_ == cwd
+        ) {
             return;
         }
 
         const auto cached =
             skill_catalog_by_cwd_.find(cwd);
 
-        if (cached != skill_catalog_by_cwd_.end()) {
+        if (
+            !force_reload &&
+            cached != skill_catalog_by_cwd_.end()
+        ) {
             skill_catalog_ = cached->second;
             skill_catalog_cwd_ = cwd;
             return;
         }
 
-        skill_catalog_.clear();
-        skill_catalog_cwd_.clear();
+        if (skill_catalog_cwd_ != cwd) {
+            skill_catalog_.clear();
+            skill_catalog_cwd_.clear();
+        }
 
         if (skill_loaders_.find(cwd) !=
             skill_loaders_.end()) {
+            if (force_reload) {
+                skill_reload_pending_.insert(cwd);
+            }
             return;
         }
 
@@ -9144,7 +9931,7 @@ button.approval-danger-button {
         auto& loader = skill_loaders_[cwd];
 
         loader = std::thread(
-            [this, cwd, environment]() {
+            [this, cwd, environment, force_reload]() {
                 CompletedSkillLoad completed;
                 completed.cwd = cwd;
 
@@ -9169,7 +9956,7 @@ button.approval-danger-button {
                         const auto result =
                             client.list_skills(
                                 cwd,
-                                false,
+                                force_reload,
                                 10000);
 
                         if (!result.success) {
@@ -9200,9 +9987,6 @@ button.approval-danger-button {
                                 ) {
                                     if (
                                         !skill.is_object() ||
-                                        !skill.value(
-                                            "enabled",
-                                            false) ||
                                         !skill.contains("name") ||
                                         !skill["name"].is_string() ||
                                         !skill.contains("path") ||
@@ -9211,8 +9995,15 @@ button.approval-danger-button {
                                         continue;
                                     }
 
-                                    completed.skills.push_back(
+                                    completed.all_skills.push_back(
                                         skill);
+
+                                    if (skill.value(
+                                            "enabled",
+                                            false)) {
+                                        completed.skills.push_back(
+                                            skill);
+                                    }
                                 }
                             }
                         }
@@ -9259,32 +10050,377 @@ button.approval-danger-button {
                     << ": "
                     << completed.error
                     << '\n';
-                continue;
+            } else {
+                skill_catalog_by_cwd_[completed.cwd] =
+                    completed.skills;
+                all_skill_catalog_by_cwd_[completed.cwd] =
+                    completed.all_skills;
             }
 
-            skill_catalog_by_cwd_[completed.cwd] =
-                completed.skills;
-
-            if (
+            const bool current_catalog =
                 completed.cwd ==
                     last_active_thread_cwd_ ||
                 (
                     current_thread_id_.empty() &&
                     completed.cwd ==
                         selected_folder_path_
-                )
-            ) {
-                skill_catalog_ = completed.skills;
-                skill_catalog_cwd_ = completed.cwd;
+                );
+
+            if (current_catalog) {
+                if (completed.error.empty()) {
+                    skill_catalog_ = completed.skills;
+                    skill_catalog_cwd_ = completed.cwd;
+                    settings_window_.set_skills(
+                        completed.cwd,
+                        completed.all_skills);
+                    refresh_skill_file_monitors(
+                        completed.cwd,
+                        completed.all_skills);
+                } else {
+                    const auto existing =
+                        all_skill_catalog_by_cwd_.find(
+                            completed.cwd);
+                    settings_window_.set_skills(
+                        completed.cwd,
+                        existing ==
+                                all_skill_catalog_by_cwd_.end()
+                            ? std::vector<nlohmann::json>{}
+                            : existing->second,
+                        completed.error);
+                }
+
+                update_send_button_state();
             }
 
-            std::cout
-                << "PASS: loaded "
-                << completed.skills.size()
-                << " enabled Codex skill(s) for "
-                << completed.cwd
-                << '\n';
+            if (completed.error.empty()) {
+                std::cout
+                    << "PASS: loaded "
+                    << completed.skills.size()
+                    << " enabled Codex skill(s) for "
+                    << completed.cwd
+                    << '\n';
+            }
+
+            if (
+                skill_reload_pending_.erase(
+                    completed.cwd) > 0
+            ) {
+                load_skills_for_cwd(
+                    completed.cwd,
+                    true);
+            }
         }
+    }
+
+    void refresh_active_skills() {
+        const std::string cwd =
+            !last_active_thread_cwd_.empty()
+                ? last_active_thread_cwd_
+                : selected_folder_path_;
+
+        if (cwd.empty()) {
+            settings_window_.set_skills(
+                {},
+                {},
+                "Select a project or thread before refreshing skills.");
+            return;
+        }
+
+        load_skills_for_cwd(cwd, true);
+    }
+
+    bool handle_skill_refresh_timeout() {
+        skill_refresh_scheduled_ = false;
+        refresh_active_skills();
+        return false;
+    }
+
+    void schedule_skill_catalog_refresh() {
+        skill_catalog_by_cwd_.clear();
+        all_skill_catalog_by_cwd_.clear();
+
+        if (skill_refresh_scheduled_) {
+            return;
+        }
+
+        skill_refresh_scheduled_ = true;
+        skill_refresh_timeout_connection_ =
+            Glib::signal_timeout().connect(
+                sigc::mem_fun(
+                    *this,
+                    &MainWindow::handle_skill_refresh_timeout),
+                500);
+    }
+
+    void handle_skill_file_changed(
+        const Glib::RefPtr<Gio::File>&,
+        const Glib::RefPtr<Gio::File>&,
+        Gio::FileMonitorEvent
+    ) {
+        schedule_skill_catalog_refresh();
+    }
+
+    void refresh_skill_file_monitors(
+        const std::string& cwd,
+        const std::vector<nlohmann::json>& skills
+    ) {
+        skill_file_monitors_.clear();
+
+        std::set<std::filesystem::path> candidates;
+        const std::filesystem::path home =
+            Glib::get_home_dir();
+
+        candidates.insert(home / ".agents" / "skills");
+        candidates.insert("/etc/codex/skills");
+
+        std::filesystem::path cursor = cwd;
+
+        while (!cursor.empty()) {
+            candidates.insert(
+                cursor / ".agents" / "skills");
+
+            const auto parent = cursor.parent_path();
+            if (parent == cursor) {
+                break;
+            }
+            cursor = parent;
+        }
+
+        for (const auto& skill : skills) {
+            if (
+                skill.value(
+                    "scope",
+                    std::string{}) == "system"
+            ) {
+                // Starting Codex refreshes its bundled system-skill
+                // files. Watching those paths would turn that normal
+                // refresh into an endless skills/list reload loop.
+                continue;
+            }
+
+            const std::filesystem::path path =
+                skill.value(
+                    "path",
+                    std::string{});
+
+            if (path.empty()) {
+                continue;
+            }
+
+            candidates.insert(path.parent_path());
+            candidates.insert(
+                path.parent_path().parent_path());
+        }
+
+        for (const auto& path : candidates) {
+            std::error_code error;
+
+            if (
+                path.empty() ||
+                !std::filesystem::is_directory(
+                    path,
+                    error)
+            ) {
+                continue;
+            }
+
+            try {
+                const auto file =
+                    Gio::File::create_for_path(
+                        path.string());
+                const auto monitor =
+                    file->monitor_directory();
+                monitor->signal_changed().connect(
+                    sigc::mem_fun(
+                        *this,
+                        &MainWindow::handle_skill_file_changed));
+                skill_file_monitors_.push_back(
+                    monitor);
+            } catch (const Glib::Error& error) {
+                std::cerr
+                    << "WARN: could not monitor skill directory "
+                    << path
+                    << ": "
+                    << error.what()
+                    << '\n';
+            }
+        }
+    }
+
+    void set_skill_enabled_async(
+        const std::string& path,
+        bool enabled
+    ) {
+        if (skill_config_busy_) {
+            settings_window_.set_skill_operation_result(
+                "Another skill setting is still being updated.");
+            return;
+        }
+
+        if (skill_config_worker_.joinable()) {
+            skill_config_worker_.join();
+        }
+
+        const std::string cwd =
+            !last_active_thread_cwd_.empty()
+                ? last_active_thread_cwd_
+                : selected_folder_path_;
+        const auto environment =
+            current_codex_process_environment();
+
+        skill_config_busy_ = true;
+        skill_config_worker_ = std::thread(
+            [this, cwd, path, enabled, environment]() {
+                CompletedSkillConfig completed;
+                completed.cwd = cwd;
+                completed.path = path;
+                completed.enabled = enabled;
+
+                AppServerClient client;
+                std::string error;
+
+                if (!client.start(error, environment)) {
+                    completed.result.error =
+                        "Could not start Codex App Server: " +
+                        error;
+                } else {
+                    const auto initialized =
+                        client.initialize(
+                            "threaddeck",
+                            "ThreadDeck",
+                            "0.1.0");
+
+                    if (!initialized.success) {
+                        completed.result.error =
+                            initialized.error;
+                    } else {
+                        completed.result =
+                            client.set_skill_enabled(
+                                path,
+                                enabled,
+                                10000);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        skill_config_result_mutex_);
+                    pending_skill_config_results_.push_back(
+                        std::move(completed));
+                }
+
+                skill_config_dispatcher_.emit();
+            });
+    }
+
+    void handle_skill_config_finished() {
+        if (skill_config_worker_.joinable()) {
+            skill_config_worker_.join();
+        }
+
+        std::deque<CompletedSkillConfig> completed;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                skill_config_result_mutex_);
+            completed.swap(
+                pending_skill_config_results_);
+        }
+
+        skill_config_busy_ = false;
+
+        for (auto& operation : completed) {
+            if (operation.result.success) {
+                settings_window_.set_skill_operation_result(
+                    operation.enabled
+                        ? "Skill enabled. Refreshing the catalog…"
+                        : "Skill disabled. Refreshing the catalog…");
+            } else {
+                settings_window_.set_skill_operation_result(
+                    "Skill setting was not changed: " +
+                    operation.result.error);
+            }
+
+            load_skills_for_cwd(
+                operation.cwd,
+                true);
+        }
+    }
+
+    bool start_skill_installation(
+        const std::string& requested_source,
+        std::string& error
+    ) {
+        const std::string source =
+            trim(requested_source);
+
+        if (source.empty()) {
+            error = "Enter a skill name or repository path.";
+            return false;
+        }
+
+        if (current_thread_id_.empty()) {
+            error =
+                "Select a thread where the skill-installer workflow can run.";
+            return false;
+        }
+
+        const ThreadTurnSession* session =
+            find_turn_session(current_thread_id_);
+
+        if (session != nullptr && session->busy) {
+            error =
+                "Wait for the active thread turn to finish before installing a skill.";
+            return false;
+        }
+
+        const auto* installer =
+            find_skill("skill-installer");
+
+        if (installer == nullptr) {
+            error =
+                "Codex did not report the built-in skill-installer as enabled.";
+            return false;
+        }
+
+        nlohmann::json turn_input =
+            nlohmann::json::array(
+                {
+                    {
+                        {"type", "skill"},
+                        {"name", "skill-installer"},
+                        {"path",
+                         installer->value(
+                             "path",
+                             std::string{})},
+                    },
+                    {
+                        {"type", "text"},
+                        {"text", source},
+                        {"text_elements",
+                         nlohmann::json::array()},
+                    },
+                });
+        nlohmann::json transcript_input =
+            nlohmann::json::array(
+                {
+                    {
+                        {"type", "text"},
+                        {"text",
+                         "$skill-installer " + source},
+                        {"text_elements",
+                         nlohmann::json::array()},
+                    },
+                });
+
+        append_user_content_to_transcript(
+            transcript_input);
+        start_structured_turn(
+            current_thread_id_,
+            turn_input,
+            transcript_input,
+            current_session_options());
+        return true;
     }
 
     const nlohmann::json* find_skill(
@@ -9307,61 +10443,206 @@ button.approval-danger-button {
         return nullptr;
     }
 
+    nlohmann::json native_prompt_input(
+        const std::string& text,
+        std::string* resolved_skill = nullptr
+    ) const {
+        nlohmann::json input =
+            nlohmann::json::array();
+
+        if (resolved_skill != nullptr) {
+            resolved_skill->clear();
+        }
+
+        if (text.empty()) {
+            return input;
+        }
+
+        if (text.front() == '$') {
+            const std::size_t token_end =
+                text.find_first_of(" \t\r\n");
+            const std::string skill_name =
+                text.substr(
+                    1,
+                    token_end == std::string::npos
+                        ? std::string::npos
+                        : token_end - 1);
+            const auto* skill = find_skill(skill_name);
+
+            if (skill != nullptr) {
+                input.push_back(
+                    {
+                        {"type", "skill"},
+                        {"name", skill_name},
+                        {"path",
+                         skill->value(
+                             "path",
+                             std::string{})},
+                    });
+
+                const std::string remainder =
+                    token_end == std::string::npos
+                        ? std::string{}
+                        : trim(text.substr(token_end));
+
+                if (!remainder.empty()) {
+                    input.push_back(
+                        {
+                            {"type", "text"},
+                            {"text", remainder},
+                            {"text_elements",
+                             nlohmann::json::array()},
+                        });
+                }
+
+                if (resolved_skill != nullptr) {
+                    *resolved_skill = skill_name;
+                }
+
+                return input;
+            }
+        }
+
+        input.push_back(
+            {
+                {"type", "text"},
+                {"text", text},
+                {"text_elements",
+                 nlohmann::json::array()},
+            });
+
+        return input;
+    }
+
     void select_skill_suggestion(
         const std::string& name
     ) {
-        prompt_.get_buffer()->set_text(
-            "$" + name + " ");
+        const auto buffer = prompt_.get_buffer();
+        const std::string current =
+            buffer->get_text().raw();
+        std::string replacement =
+            "$" + name + " ";
 
+        if (!current.empty() && current.front() == '$') {
+            const std::size_t token_end =
+                current.find_first_of(" \t\r\n");
+
+            if (token_end != std::string::npos) {
+                replacement += trim(
+                    current.substr(token_end));
+            }
+        } else {
+            replacement += current;
+        }
+
+        begin_prompt_history_transaction();
+        buffer->set_text(replacement);
+        end_prompt_history_transaction();
+
+        skill_picker_search_active_ = false;
         skill_popover_.popdown();
         prompt_.grab_focus();
-
-        const auto buffer =
-            prompt_.get_buffer();
 
         buffer->place_cursor(
             buffer->end());
     }
 
-    void update_skill_suggestions() {
+    void show_skill_picker() {
+        if (current_thread_id_.empty()) {
+            status_label_.set_text(
+                "Codex: select a thread first");
+            return;
+        }
+
+        if (skill_catalog_.empty()) {
+            status_label_.set_text(
+                "Codex: no enabled skills found for this project");
+            return;
+        }
+
+        skill_picker_search_active_ = false;
+        skill_search_.set_text("");
+        skill_picker_search_active_ = true;
+
+        // Open after the button-release event has finished. Opening a
+        // modal popover from the click handler lets that same release
+        // event dismiss it immediately on some GTK configurations.
+        Glib::signal_idle().connect(
+            [this]() {
+                if (!skill_picker_search_active_) {
+                    return false;
+                }
+
+                update_skill_suggestions(true);
+
+                if (skill_popover_.get_visible()) {
+                    skill_search_.grab_focus();
+                }
+
+                return false;
+            });
+    }
+
+    void update_skill_suggestions(
+        bool show_all = false
+    ) {
         clear_skill_suggestions();
 
         if (
-            turn_in_progress_ ||
-            shell_command_in_progress_ ||
             current_thread_id_.empty() ||
-            skill_catalog_.empty()
+            skill_catalog_.empty() ||
+            !current_composer_accepts_attachments()
         ) {
             skill_popover_.popdown();
             return;
         }
 
-        const std::string text = trim(
-            prompt_.get_buffer()
-                ->get_text()
-                .raw());
+        std::string query;
 
-        if (
-            text.empty() ||
-            text.front() != '$'
-        ) {
-            skill_popover_.popdown();
-            return;
+        if (show_all) {
+            query = trim(
+                skill_search_.get_text().raw());
+        } else {
+            const std::string text = trim(
+                prompt_.get_buffer()
+                    ->get_text()
+                    .raw());
+
+            if (
+                text.empty() ||
+                text.front() != '$'
+            ) {
+                skill_popover_.popdown();
+                return;
+            }
+
+            const std::size_t whitespace =
+                text.find_first_of(
+                    " \t\r\n");
+
+            if (whitespace != std::string::npos) {
+                skill_popover_.popdown();
+                return;
+            }
+
+            query = text.substr(1);
         }
-
-        const std::size_t whitespace =
-            text.find_first_of(
-                " \t\r\n");
-
-        if (whitespace != std::string::npos) {
-            skill_popover_.popdown();
-            return;
-        }
-
-        const std::string query =
-            text.substr(1);
 
         std::size_t shown = 0;
+        const auto lowercase =
+            [](std::string value) {
+                std::transform(
+                    value.begin(),
+                    value.end(),
+                    value.begin(),
+                    [](unsigned char character) {
+                        return static_cast<char>(
+                            std::tolower(character));
+                    });
+                return value;
+            };
+        const std::string normalized_query =
+            lowercase(query);
 
         for (
             const auto& skill :
@@ -9371,13 +10652,21 @@ button.approval-danger-button {
                 skill.value(
                     "name",
                     std::string{});
+            const std::string normalized_name =
+                lowercase(name);
 
             if (
                 name.empty() ||
-                name.compare(
-                    0,
-                    query.size(),
-                    query) != 0
+                (
+                    show_all
+                        ? normalized_name.find(
+                            normalized_query) ==
+                            std::string::npos
+                        : normalized_name.compare(
+                            0,
+                            normalized_query.size(),
+                            normalized_query) != 0
+                )
             ) {
                 continue;
             }
@@ -9453,7 +10742,10 @@ button.approval-danger-button {
 
             ++shown;
 
-            if (shown >= 8) {
+            if (
+                shown >=
+                    (show_all ? 100U : 8U)
+            ) {
                 break;
             }
         }
@@ -9463,8 +10755,27 @@ button.approval-danger-button {
             return;
         }
 
-        skill_suggestions_.show_all_children();
-        skill_popover_.show();
+        skill_popover_.set_relative_to(
+            show_all
+                ? static_cast<Gtk::Widget&>(skill_button_)
+                : static_cast<Gtk::Widget&>(prompt_));
+        skill_suggestions_scroll_.set_size_request(
+            show_all ? 520 : -1,
+            show_all ? 320 : -1);
+
+        if (show_all) {
+            skill_search_.show();
+        } else {
+            skill_picker_search_active_ = false;
+            skill_search_.hide();
+        }
+
+        skill_popover_.show_all();
+
+        if (!show_all) {
+            skill_search_.hide();
+        }
+
         skill_popover_.popup();
     }
 
@@ -10031,6 +11342,19 @@ button.approval-danger-button {
 
         const bool accepts_attachments =
             current_composer_accepts_attachments();
+        const bool accepts_skills =
+            accepts_attachments &&
+            !skill_catalog_.empty() &&
+            skill_catalog_cwd_ == last_active_thread_cwd_;
+        skill_button_.set_sensitive(
+            accepts_skills);
+        skill_button_.set_tooltip_text(
+            accepts_skills
+                ? "Choose from " +
+                    std::to_string(
+                        skill_catalog_.size()) +
+                    " enabled Codex skill(s) for this project"
+                : "No enabled Codex skills are available for this project");
         attachment_button_.set_sensitive(
             accepts_attachments);
         audio_attachment_button_.set_sensitive(
@@ -10378,6 +11702,8 @@ button.approval-danger-button {
     void run_thread_search_worker() {
         AppServerClient client;
         bool client_ready = false;
+        ThreadSearchIndex index;
+        bool index_ready = false;
 
         while (true) {
             ThreadSearchRequest request;
@@ -10405,18 +11731,24 @@ button.approval-danger-button {
             completed.generation = request.generation;
             completed.search_term = request.search_term;
 
-            if (!client_ready) {
+            if (!index_ready) {
+                index_ready = index.open(
+                    thread_search_index_path(),
+                    completed.error);
+            }
+
+            if (completed.error.empty() && !client_ready) {
                 std::string error;
 
                 if (!client.start(error, request.environment)) {
                     completed.error =
-                        "Could not start the Codex search service: " +
+                        "Could not start the thread index reader: " +
                         error;
                 } else {
                     const auto initialized =
                         client.initialize(
-                            "threaddeck-search",
-                            "ThreadDeck Search",
+                            "threaddeck-indexer",
+                            "ThreadDeck Indexer",
                             "0.1.0");
 
                     if (!initialized.success) {
@@ -10429,7 +11761,6 @@ button.approval-danger-button {
             }
 
             std::string cursor;
-            std::set<std::string> result_ids;
 
             while (
                 completed.error.empty() &&
@@ -10437,10 +11768,11 @@ button.approval-danger-button {
                     request.generation)
             ) {
                 const auto page =
-                    client.search_threads(
-                        request.search_term,
+                    client.list_threads(
+                        {},
                         100,
                         10000,
+                        true,
                         cursor);
 
                 if (!page.success) {
@@ -10450,30 +11782,57 @@ button.approval-danger-button {
                     break;
                 }
 
-                for (const auto& match : page.matches) {
-                    nlohmann::json thread = match["thread"];
-                    const std::string thread_id =
-                        thread.value(
-                            "id",
-                            std::string{});
+                for (const auto& summary : page.threads) {
+                    if (thread_search_is_superseded(
+                            request.generation)) {
+                        break;
+                    }
 
-                    if (
-                        thread_id.empty() ||
-                        !result_ids.insert(thread_id).second
-                    ) {
+                    bool refresh = false;
+                    std::string index_error;
+
+                    if (!index.needs_refresh(
+                            summary,
+                            refresh,
+                            index_error)) {
+                        completed.error = index_error;
+                        break;
+                    }
+
+                    if (!refresh) {
                         continue;
                     }
 
-                    if (
-                        match.contains("snippet") &&
-                        match["snippet"].is_string()
-                    ) {
-                        thread["_threaddeckSearchSnippet"] =
-                            match["snippet"];
+                    const std::string thread_id =
+                        summary.value(
+                            "id",
+                            std::string{});
+
+                    if (thread_id.empty()) {
+                        continue;
                     }
 
-                    completed.threads.push_back(
-                        std::move(thread));
+                    const auto read = client.read_thread(
+                        thread_id,
+                        true,
+                        10000);
+
+                    if (!read.success) {
+                        std::cerr
+                            << "WARN: could not index thread "
+                            << thread_id
+                            << ": "
+                            << read.error
+                            << '\n';
+                        continue;
+                    }
+
+                    if (!index.replace_thread(
+                            read.thread,
+                            index_error)) {
+                        completed.error = index_error;
+                        break;
+                    }
                 }
 
                 if (page.next_cursor.empty()) {
@@ -10481,6 +11840,29 @@ button.approval-danger-button {
                 }
 
                 cursor = page.next_cursor;
+            }
+
+            if (
+                completed.error.empty() &&
+                !thread_search_is_superseded(
+                    request.generation)
+            ) {
+                std::vector<ThreadSearchIndex::Match> matches;
+
+                if (!index.search(
+                        request.search_term,
+                        500,
+                        matches,
+                        completed.error)) {
+                    matches.clear();
+                }
+
+                for (auto& match : matches) {
+                    match.thread["_threaddeckSearchSnippet"] =
+                        std::move(match.snippet);
+                    completed.threads.push_back(
+                        std::move(match.thread));
+                }
             }
 
             if (thread_search_is_superseded(
@@ -11727,11 +13109,23 @@ button.approval-danger-button {
 
             if (thread_search_loading_) {
                 search_status =
-                    "Searching all thread messages…";
+                    "Indexing and searching stored threads…";
             } else if (!thread_search_error_.empty()) {
                 search_status =
-                    "Full-text search is unavailable: " +
+                    "Local thread search is unavailable: " +
                     thread_search_error_;
+            } else if (
+                thread_search_result_term_ == search_term
+            ) {
+                const std::size_t count =
+                    thread_search_results_.size();
+
+                search_status = count == 0
+                    ? "No matches in indexed threads."
+                    : std::to_string(count) +
+                        (count == 1
+                            ? " matching thread."
+                            : " matching threads.");
             }
 
             if (!search_status.empty()) {
@@ -11761,7 +13155,6 @@ button.approval-danger-button {
                         cwd,
                         100,
                         10000,
-                        {},
                         true);
 
                 if (result.success) {
@@ -12145,7 +13538,6 @@ button.approval-danger-button {
                             cwd,
                             100,
                             10000,
-                            {},
                             true);
 
                     if (result.success) {
@@ -12302,6 +13694,22 @@ button.approval-danger-button {
                     !is_busy &&
                     completed_unseen_threads_.find(thread_id) !=
                         completed_unseen_threads_.end();
+                std::string search_snippet;
+
+                if (
+                    searching &&
+                    thread.contains(
+                        "_threaddeckSearchSnippet") &&
+                    thread[
+                        "_threaddeckSearchSnippet"
+                    ].is_string()
+                ) {
+                    search_snippet = single_line_preview(
+                        thread[
+                            "_threaddeckSearchSnippet"
+                        ].get<std::string>(),
+                        180);
+                }
 
                 auto* thread_row =
                     Gtk::manage(
@@ -12377,9 +13785,19 @@ button.approval-danger-button {
                     auto* thread_button_content =
                         Gtk::manage(
                             new Gtk::Box(
+                                Gtk::ORIENTATION_VERTICAL));
+
+                    auto* thread_title_row =
+                        Gtk::manage(
+                            new Gtk::Box(
                                 Gtk::ORIENTATION_HORIZONTAL));
 
                     thread_button_content->set_spacing(6);
+                    thread_button_content->set_valign(
+                        Gtk::ALIGN_CENTER);
+                    thread_title_row->set_spacing(6);
+                    thread_title_row->set_valign(
+                        Gtk::ALIGN_CENTER);
 
                     if (is_busy) {
                         auto* spinner =
@@ -12394,7 +13812,7 @@ button.approval-danger-button {
                             ->add_class("working-spinner");
                         spinner->start();
 
-                        thread_button_content->pack_start(
+                        thread_title_row->pack_start(
                             *spinner,
                             Gtk::PACK_SHRINK);
 
@@ -12406,7 +13824,7 @@ button.approval-danger-button {
                         current_dot->set_tooltip_text(
                             "Current thread");
 
-                        thread_button_content->pack_start(
+                        thread_title_row->pack_start(
                             *current_dot,
                             Gtk::PACK_SHRINK);
                     }
@@ -12422,9 +13840,32 @@ button.approval-danger-button {
                     thread_name->set_ellipsize(
                         Pango::ELLIPSIZE_END);
 
-                    thread_button_content->pack_start(
+                    thread_title_row->pack_start(
                         *thread_name,
                         Gtk::PACK_EXPAND_WIDGET);
+
+                    thread_button_content->pack_start(
+                        *thread_title_row,
+                        Gtk::PACK_SHRINK);
+
+                    if (!search_snippet.empty()) {
+                        auto* snippet_label =
+                            Gtk::manage(
+                                new Gtk::Label(
+                                    "Match: " +
+                                    search_snippet));
+
+                        snippet_label->set_xalign(0.0F);
+                        snippet_label->set_hexpand(true);
+                        snippet_label->set_ellipsize(
+                            Pango::ELLIPSIZE_END);
+                        snippet_label->get_style_context()
+                            ->add_class(
+                                "thread-search-snippet");
+                        thread_button_content->pack_start(
+                            *snippet_label,
+                            Gtk::PACK_SHRINK);
+                    }
 
                     thread_button->add(
                         *thread_button_content);
@@ -12439,25 +13880,9 @@ button.approval-danger-button {
                     std::string thread_tooltip =
                         thread_id;
 
-                    if (
-                        searching &&
-                        thread.contains(
-                            "_threaddeckSearchSnippet") &&
-                        thread[
-                            "_threaddeckSearchSnippet"
-                        ].is_string()
-                    ) {
-                        const std::string snippet =
-                            single_line_preview(
-                                thread[
-                                    "_threaddeckSearchSnippet"
-                                ].get<std::string>(),
-                                180);
-
-                        if (!snippet.empty()) {
-                            thread_tooltip +=
-                                "\n\nMatch: " + snippet;
-                        }
+                    if (!search_snippet.empty()) {
+                        thread_tooltip +=
+                            "\n\nMatch: " + search_snippet;
                     }
 
                     thread_button->set_tooltip_text(
@@ -12515,13 +13940,36 @@ button.approval-danger-button {
                                 this,
                                 cwd,
                                 project_id,
-                                thread_id
+                                thread_id,
+                                searching,
+                                search_term
                             ]() {
+                                if (searching) {
+                                    pending_search_jump_thread_id_ =
+                                        thread_id;
+                                    pending_search_jump_term_ =
+                                        search_term;
+                                    transcript_follow_output_ = false;
+                                }
+
                                 activate_thread(
                                     cwd,
                                     thread_id,
                                     false,
                                     project_id);
+
+                                if (searching) {
+                                    Glib::signal_idle().connect(
+                                        [this, thread_id]() {
+                                            if (
+                                                current_thread_id_ ==
+                                                thread_id
+                                            ) {
+                                                scroll_to_pending_search_match();
+                                            }
+                                            return false;
+                                        });
+                                }
                             });
 
                     thread_row->pack_start(
@@ -15417,7 +16865,15 @@ button.approval-danger-button {
     struct CompletedSkillLoad {
         std::string cwd;
         std::vector<nlohmann::json> skills;
+        std::vector<nlohmann::json> all_skills;
         std::string error;
+    };
+
+    struct CompletedSkillConfig {
+        std::string cwd;
+        std::string path;
+        bool enabled{false};
+        AppServerClient::JsonResult result;
     };
 
     struct CompletedThreadMove {
@@ -15790,6 +17246,12 @@ button.approval-danger-button {
 
                     if (
                         job->thread_id == current_thread_id_ &&
+                        pending_search_jump_thread_id_ ==
+                            job->thread_id
+                    ) {
+                        scroll_to_pending_search_match();
+                    } else if (
+                        job->thread_id == current_thread_id_ &&
                         transcript_follow_output_
                     ) {
                         scroll_transcript_to_end();
@@ -15928,6 +17390,66 @@ button.approval-danger-button {
             Glib::PRIORITY_DEFAULT_IDLE);
     }
 
+    bool scroll_to_pending_search_match(
+        bool final_pass = false
+    ) {
+        if (
+            pending_search_jump_thread_id_.empty() ||
+            pending_search_jump_term_.empty() ||
+            pending_search_jump_thread_id_ !=
+                current_thread_id_
+        ) {
+            return false;
+        }
+
+        const auto buffer = transcript_.get_buffer();
+        if (!buffer || buffer->get_char_count() == 0) {
+            return false;
+        }
+
+        auto search_start = buffer->begin();
+        Gtk::TextIter match_start;
+        Gtk::TextIter match_end;
+
+        if (!search_start.forward_search(
+                pending_search_jump_term_,
+                Gtk::TEXT_SEARCH_CASE_INSENSITIVE |
+                    Gtk::TEXT_SEARCH_TEXT_ONLY,
+                match_start,
+                match_end)) {
+            return false;
+        }
+
+        transcript_follow_output_ = false;
+        transcript_scroll_programmatic_ = true;
+        buffer->select_range(match_start, match_end);
+        transcript_.scroll_to(
+            match_start,
+            0.12,
+            0.0,
+            0.30);
+        transcript_scroll_programmatic_ = false;
+        refresh_transcript_bottom_button();
+
+        if (final_pass) {
+            pending_search_jump_thread_id_.clear();
+            pending_search_jump_term_.clear();
+            search_jump_finalize_scheduled_ = false;
+        } else if (!search_jump_finalize_scheduled_) {
+            search_jump_finalize_scheduled_ = true;
+
+            Glib::signal_timeout().connect(
+                [this]() {
+                    search_jump_finalize_scheduled_ = false;
+                    scroll_to_pending_search_match(true);
+                    return false;
+                },
+                60);
+        }
+
+        return true;
+    }
+
     void show_running_thread(
         ThreadTurnSession& session
     ) {
@@ -16056,7 +17578,16 @@ button.approval-danger-button {
         if (session.transcript_buffer) {
             attach_thread_transcript_buffer(
                 session.transcript_buffer);
-            scroll_transcript_to_end(true);
+
+            if (
+                pending_search_jump_thread_id_ ==
+                    session.thread_id
+            ) {
+                transcript_follow_output_ = false;
+                scroll_to_pending_search_match();
+            } else {
+                scroll_transcript_to_end(true);
+            }
         } else {
             session.transcript_buffer =
                 create_thread_transcript_buffer();
@@ -16621,6 +18152,18 @@ button.approval-danger-button {
         const bool at_bottom =
             transcript_is_at_bottom();
 
+        if (
+            !pending_search_jump_thread_id_.empty() &&
+            pending_search_jump_thread_id_ ==
+                current_thread_id_
+        ) {
+            transcript_follow_output_ = false;
+            transcript_last_scroll_value_ = value;
+            transcript_last_scroll_upper_ = upper;
+            refresh_transcript_bottom_button();
+            return;
+        }
+
         if (transcript_scroll_programmatic_) {
             transcript_last_scroll_value_ = value;
             transcript_last_scroll_upper_ = upper;
@@ -16659,6 +18202,17 @@ button.approval-danger-button {
         if (
             transcript_follow_output_ &&
             !at_bottom
+        ) {
+            scroll_transcript_to_end();
+        }
+    }
+
+    void handle_transcript_extent_changed() {
+        refresh_transcript_bottom_button();
+
+        if (
+            transcript_follow_output_ &&
+            !transcript_is_at_bottom()
         ) {
             scroll_transcript_to_end();
         }
@@ -19735,6 +21289,11 @@ button.approval-danger-button {
             }
 
             case AppServerClient::TurnEvent::Type::
+                SkillsChanged:
+                schedule_skill_catalog_refresh();
+                break;
+
+            case AppServerClient::TurnEvent::Type::
                 ItemStarted:
             case AppServerClient::TurnEvent::Type::
                 ItemCompleted: {
@@ -20153,14 +21712,20 @@ button.approval-danger-button {
             "threaddeck-follow-up-" +
             std::to_string(
                 ++follow_up_sequence_);
+        std::string resolved_skill;
+
         if (!text.empty()) {
-            follow_up.input.push_back(
-                {
-                    {"type", "text"},
-                    {"text", text},
-                    {"text_elements",
-                     nlohmann::json::array()},
-                });
+            follow_up.input =
+                native_prompt_input(
+                    text,
+                    &resolved_skill);
+        }
+
+        if (!resolved_skill.empty()) {
+            std::cout
+                << "PASS: resolved native follow-up $skill "
+                << resolved_skill
+                << '\n';
         }
 
         for (const auto& image_path :
@@ -21010,11 +22575,16 @@ button.approval-danger-button {
             session_options =
                 current_session_options();
 
+        std::string resolved_skill;
         nlohmann::json turn_input =
+            native_prompt_input(
+                prompt_text,
+                &resolved_skill);
+        nlohmann::json transcript_input =
             nlohmann::json::array();
 
         if (!prompt_text.empty()) {
-            turn_input.push_back(
+            transcript_input.push_back(
                 {
                     {"type", "text"},
                     {"text", prompt_text},
@@ -21023,63 +22593,11 @@ button.approval-danger-button {
                 });
         }
 
-        nlohmann::json transcript_input =
-            turn_input;
-
-        if (
-            !prompt_text.empty() &&
-            prompt_text.front() == '$'
-        ) {
-            const std::size_t token_end =
-                prompt_text.find_first_of(
-                    " \t\r\n");
-
-            const std::string skill_name =
-                prompt_text.substr(
-                    1,
-                    token_end == std::string::npos
-                        ? std::string::npos
-                        : token_end - 1);
-
-            const auto* skill =
-                find_skill(skill_name);
-
-            if (skill != nullptr) {
-                turn_input =
-                    nlohmann::json::array();
-
-                turn_input.push_back(
-                    {
-                        {"type", "skill"},
-                        {"name", skill_name},
-                        {"path",
-                         skill->value(
-                             "path",
-                             std::string{})},
-                    });
-
-                const std::string remainder =
-                    token_end == std::string::npos
-                        ? std::string{}
-                        : trim(
-                            prompt_text.substr(
-                                token_end));
-
-                if (!remainder.empty()) {
-                    turn_input.push_back(
-                        {
-                            {"type", "text"},
-                            {"text", remainder},
-                            {"text_elements",
-                             nlohmann::json::array()},
-                        });
-                }
-
-                std::cout
-                    << "PASS: resolved native $skill "
-                    << skill_name
-                    << '\n';
-            }
+        if (!resolved_skill.empty()) {
+            std::cout
+                << "PASS: resolved native $skill "
+                << resolved_skill
+                << '\n';
         }
 
         for (
@@ -22095,6 +23613,7 @@ button.approval-danger-button {
     Gtk::Image folder_image_;
     Gtk::Image new_thread_image_;
     Gtk::Image context_image_;
+    Gtk::Image skill_image_;
     Gtk::Image attachment_image_;
     Gtk::Image audio_attachment_image_;
     Gtk::Image send_image_;
@@ -22112,6 +23631,7 @@ button.approval-danger-button {
     Gtk::Button pause_button_;
     Gtk::ToggleButton remote_shield_button_;
     Gtk::ToggleButton context_toggle_button_;
+    Gtk::Button skill_button_;
     Gtk::Button attachment_button_;
     Gtk::Button audio_attachment_button_;
     Gtk::Button clear_attachments_button_;
@@ -22158,14 +23678,19 @@ button.approval-danger-button {
         Gtk::ORIENTATION_VERTICAL};
 
     Gtk::ScrolledWindow transcript_scroll_;
+    Gtk::ScrolledWindow session_controls_scroll_;
     Gtk::Overlay transcript_overlay_;
     Gtk::ScrolledWindow prompt_scroll_;
     Gtk::ScrolledWindow attachment_preview_scroll_;
+    Gtk::ScrolledWindow skill_suggestions_scroll_;
     Gtk::Box attachment_previews_{
         Gtk::ORIENTATION_HORIZONTAL};
     Gtk::TextView transcript_;
     Gtk::TextView prompt_;
     Gtk::Popover skill_popover_;
+    Gtk::Box skill_popover_content_{
+        Gtk::ORIENTATION_VERTICAL};
+    Gtk::SearchEntry skill_search_;
     Gtk::Box skill_suggestions_{
         Gtk::ORIENTATION_VERTICAL};
 
@@ -22221,6 +23746,7 @@ button.approval-danger-button {
     bool auto_copy_button_updating_{false};
     bool remote_shield_button_updating_{false};
     bool remote_hosts_panel_visible_{false};
+    bool skill_picker_search_active_{false};
     std::string shield_operation_thread_id_;
 
     std::vector<std::string>
@@ -22239,6 +23765,12 @@ button.approval-danger-button {
         std::string,
         std::vector<nlohmann::json>
     > skill_catalog_by_cwd_;
+    std::map<
+        std::string,
+        std::vector<nlohmann::json>
+    > all_skill_catalog_by_cwd_;
+    std::set<std::string>
+        skill_reload_pending_;
 
     std::vector<std::string>
         attached_image_paths_;
@@ -22343,6 +23875,7 @@ button.approval-danger-button {
     Glib::Dispatcher thread_activation_dispatcher_;
     Glib::Dispatcher thread_move_dispatcher_;
     Glib::Dispatcher skill_load_dispatcher_;
+    Glib::Dispatcher skill_config_dispatcher_;
     Glib::Dispatcher shield_dispatcher_;
     Glib::Dispatcher shell_command_dispatcher_;
     Glib::Dispatcher approval_dispatcher_;
@@ -22374,6 +23907,15 @@ button.approval-danger-button {
         pending_skill_load_results_;
     std::map<std::string, std::thread>
         skill_loaders_;
+    std::thread skill_config_worker_;
+    std::mutex skill_config_result_mutex_;
+    std::deque<CompletedSkillConfig>
+        pending_skill_config_results_;
+    bool skill_config_busy_{false};
+    std::vector<Glib::RefPtr<Gio::FileMonitor>>
+        skill_file_monitors_;
+    sigc::connection skill_refresh_timeout_connection_;
+    bool skill_refresh_scheduled_{false};
 
     std::thread shield_worker_;
     std::mutex shield_result_mutex_;
@@ -22405,6 +23947,9 @@ button.approval-danger-button {
         thread_search_results_;
     std::string thread_search_result_term_;
     std::string thread_search_error_;
+    std::string pending_search_jump_thread_id_;
+    std::string pending_search_jump_term_;
+    bool search_jump_finalize_scheduled_{false};
 
     std::string active_turn_id_;
     bool stop_requested_{false};
@@ -22549,14 +24094,14 @@ void load_default_window_icon(const char* argv0) {
         if (!exe_ec) {
             candidates.push_back(
                 exe_dir / "assets" / "icons" /
-                "threaddeck.svg");
+                "threaddeck.png");
             candidates.push_back(
                 exe_dir.parent_path() / "assets" /
-                "icons" / "threaddeck.svg");
+                "icons" / "threaddeck.png");
         }
     }
     candidates.push_back(
-        fs::path("assets/icons/threaddeck.svg"));
+        fs::path("assets/icons/threaddeck.png"));
 
     for (const auto& candidate : candidates) {
         std::error_code exists_ec;

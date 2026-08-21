@@ -10,7 +10,7 @@ ThreadHeader::ThreadHeader()
     row_.set_spacing(10);
 
     title_.set_xalign(0.0F);
-    title_.set_hexpand(false);
+    title_.set_hexpand(true);
     title_.set_ellipsize(
         Pango::ELLIPSIZE_END);
     title_.get_style_context()->add_class(
@@ -25,12 +25,12 @@ ThreadHeader::ThreadHeader()
         "thread-folder-chip");
 
     status_box_.set_spacing(6);
-    status_box_.set_hexpand(true);
+    status_box_.set_hexpand(false);
     status_box_.set_halign(Gtk::ALIGN_FILL);
 
     row_.pack_start(
         title_,
-        Gtk::PACK_SHRINK);
+        Gtk::PACK_EXPAND_WIDGET);
     row_.pack_start(
         status_box_,
         Gtk::PACK_EXPAND_WIDGET);
@@ -48,6 +48,10 @@ ThreadHeader::ThreadHeader()
 void ThreadHeader::attach_status_widgets(
     Gtk::Label& label
 ) {
+    label.set_ellipsize(
+        Pango::ELLIPSIZE_END);
+    label.set_max_width_chars(28);
+
     status_box_.pack_start(
         label,
         Gtk::PACK_SHRINK);

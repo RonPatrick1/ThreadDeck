@@ -74,15 +74,6 @@ public:
         std::string error;
     };
 
-    struct ThreadSearchResult {
-        bool success{false};
-        std::vector<nlohmann::json> matches;
-        std::string next_cursor;
-        nlohmann::json response;
-        std::vector<nlohmann::json> preceding_messages;
-        std::string error;
-    };
-
     struct ThreadResumeResult {
         bool success{false};
         std::string thread_id;
@@ -120,6 +111,7 @@ public:
             TokenUsageUpdated,
             ThreadSettingsUpdated,
             AccountRateLimitsUpdated,
+            SkillsChanged,
             SteerAccepted,
             SteerRejected,
         };
@@ -206,6 +198,11 @@ public:
         bool force_reload = false,
         int timeout_ms = 10000);
 
+    JsonResult set_skill_enabled(
+        const std::string& path,
+        bool enabled,
+        int timeout_ms = 10000);
+
     JsonResult run_thread_shell_command(
         const std::string& thread_id,
         const std::string& command,
@@ -221,13 +218,7 @@ public:
         const std::string& cwd,
         int limit = 100,
         int timeout_ms = 10000,
-        const std::string& search_term = {},
-        bool use_state_db_only = false);
-
-    ThreadSearchResult search_threads(
-        const std::string& search_term,
-        int limit = 100,
-        int timeout_ms = 10000,
+        bool use_state_db_only = false,
         const std::string& cursor = {});
 
     JsonResult delete_thread(

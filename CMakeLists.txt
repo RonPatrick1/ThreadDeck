@@ -35,6 +35,13 @@ pkg_check_modules(
     libsecret-1
 )
 
+pkg_check_modules(
+    SQLITE3
+    REQUIRED
+    IMPORTED_TARGET
+    sqlite3
+)
+
 add_library(codex-app-server-client STATIC
     src/app_server_client.cpp
 )
@@ -60,6 +67,7 @@ add_executable(threaddeck
     src/main.cpp
     src/context_panel.cpp
     src/secret_store.cpp
+    src/thread_search_index.cpp
     src/thread_header.cpp
 )
 
@@ -166,6 +174,7 @@ target_link_libraries(threaddeck
     PRIVATE
         PkgConfig::GTKMM
         PkgConfig::LIBSECRET
+        PkgConfig::SQLITE3
         codex-app-server-client
         Threads::Threads
 )

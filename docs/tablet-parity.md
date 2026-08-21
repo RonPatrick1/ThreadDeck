@@ -4,7 +4,7 @@ The Android tablet is a remote ThreadDeck client, not a reduced viewer. A featur
 
 ## Workspace and navigation
 
-- [x] Wireless host connection, reconnect, and persistent ADB reverse tunnel
+- [x] Private WireGuard host connection and reconnect; ADB is deployment-only
 - [x] Project names, paths, thread assignments, custom thread titles, and themes
 - [x] Project collapse/expand and global collapse/expand
 - [x] Cross-project thread search
@@ -45,3 +45,15 @@ The Android tablet is a remote ThreadDeck client, not a reduced viewer. A featur
 - [ ] Splunk host/token keyring settings
 - [ ] About/version information
 - [ ] Responsive replacements for desktop pane sizing and window-only controls
+
+## Tablet connection architecture
+
+ThreadDeck is a remote client. Codex and project files remain on the Ubuntu host.
+
+- The tablet's `ThreadDeck` WireGuard tunnel uses `10.77.0.3/32` and routes only `10.77.0.1/32`. Normal tablet traffic does not use the tunnel.
+- Android's always-on VPN setting keeps WireGuard available across app changes and tablet restarts. VPN lockdown is intentionally off because this is a split tunnel.
+- `threaddeck-tablet-bridge.service` listens only on `10.77.0.1:4545` and accepts only `10.77.0.3`.
+- The Android app connects to `ws://10.77.0.1:4545`. The WebSocket is carried inside WireGuard's encrypted, mutually authenticated tunnel.
+- `threaddeck-tablet-adb.service` is disabled. Wireless debugging is needed only when installing a new APK or collecting diagnostics.
+
+If the tablet cannot connect, check the `ThreadDeck` tunnel in WireGuard, then check the host with `sudo wg show wg0` and `systemctl --user status threaddeck-tablet-bridge.service`. No ADB reverse rule should be required.

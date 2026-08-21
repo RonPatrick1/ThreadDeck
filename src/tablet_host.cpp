@@ -131,7 +131,8 @@ int main() {
     }
 
     std::cout
-        << "ThreadDeck tablet host is ready on loopback port 4545\n";
+        << "ThreadDeck tablet host is ready; the external bridge "
+           "provides private-network access\n";
     std::cout.flush();
 
     while (running) {

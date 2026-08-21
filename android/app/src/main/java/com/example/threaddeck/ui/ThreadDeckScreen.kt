@@ -1404,7 +1404,7 @@ private fun ConnectionDialog(state: ThreadDeckUiState, actions: ThreadDeckAction
     text = {
       Column {
         Text(
-          "Wireless debugging uses the tablet's localhost tunnel. Codex and your files remain on Ubuntu.",
+          "The tablet connects directly through its private WireGuard tunnel. Wireless debugging is only used to install and diagnose the app; Codex and your files remain on Ubuntu.",
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

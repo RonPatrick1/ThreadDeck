@@ -872,12 +872,25 @@ int parse_port(const char* value) {
     return -1;
 }
 
+bool parse_ipv4_address(
+    const std::string& value,
+    in_addr& address
+) {
+    return
+        ::inet_pton(
+            AF_INET,
+            value.c_str(),
+            &address) == 1;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     std::filesystem::path socket_path =
         threaddeck::app_server_socket_path();
     int port = threaddeck::kTabletBridgePort;
+    std::string bind_address = "127.0.0.1";
+    std::string allowed_client;
 
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -898,10 +911,24 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (argument == "--bind" && index + 1 < argc) {
+            bind_address = argv[++index];
+            continue;
+        }
+
+        if (
+            argument == "--allow-client" &&
+            index + 1 < argc
+        ) {
+            allowed_client = argv[++index];
+            continue;
+        }
+
         if (argument == "--help") {
             std::cout
                 << "Usage: threaddeck-tablet-bridge "
-                << "[--socket PATH] [--port PORT]\n";
+                << "[--socket PATH] [--port PORT] "
+                << "[--bind IPV4] [--allow-client IPV4]\n";
             return 0;
         }
 
@@ -909,6 +936,26 @@ int main(int argc, char* argv[]) {
             << "Unknown argument: "
             << argument
             << '\n';
+        return 2;
+    }
+
+    in_addr bind_ipv4{};
+
+    if (!parse_ipv4_address(bind_address, bind_ipv4)) {
+        std::cerr << "Invalid tablet bridge bind address\n";
+        return 2;
+    }
+
+    in_addr allowed_client_ipv4{};
+    const bool restrict_client = !allowed_client.empty();
+
+    if (
+        restrict_client &&
+        !parse_ipv4_address(
+            allowed_client,
+            allowed_client_ipv4)
+    ) {
+        std::cerr << "Invalid tablet client address\n";
         return 2;
     }
 
@@ -938,7 +985,7 @@ int main(int argc, char* argv[]) {
     address.sin_family = AF_INET;
     address.sin_port = htons(
         static_cast<std::uint16_t>(port));
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr = bind_ipv4;
 
     if (
         ::bind(
@@ -947,7 +994,9 @@ int main(int argc, char* argv[]) {
             sizeof(address)) != 0
     ) {
         std::cerr
-            << "Could not bind tablet bridge to 127.0.0.1:"
+            << "Could not bind tablet bridge to "
+            << bind_address
+            << ':'
             << port
             << ": "
             << std::strerror(errno)
@@ -968,15 +1017,28 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout
-        << "ThreadDeck tablet bridge listening on 127.0.0.1:"
+        << "ThreadDeck tablet bridge listening on "
+        << bind_address
+        << ':'
         << port
         << " for "
         << socket_path
+        << (
+            restrict_client
+                ? " (client " + allowed_client + " only)"
+                : std::string{})
         << '\n';
 
     while (running) {
+        sockaddr_in client_address{};
+        socklen_t client_address_size =
+            sizeof(client_address);
         const int client_fd =
-            ::accept(listener_fd, nullptr, nullptr);
+            ::accept(
+                listener_fd,
+                reinterpret_cast<sockaddr*>(
+                    &client_address),
+                &client_address_size);
 
         if (client_fd < 0) {
             if (errno == EINTR) {
@@ -991,6 +1053,25 @@ int main(int argc, char* argv[]) {
                 << "Could not accept tablet connection: "
                 << std::strerror(errno)
                 << '\n';
+            continue;
+        }
+
+        if (
+            restrict_client &&
+            client_address.sin_addr.s_addr !=
+                allowed_client_ipv4.s_addr
+        ) {
+            char address_text[INET_ADDRSTRLEN]{};
+            ::inet_ntop(
+                AF_INET,
+                &client_address.sin_addr,
+                address_text,
+                sizeof(address_text));
+            std::cerr
+                << "Rejected tablet bridge client "
+                << address_text
+                << '\n';
+            ::close(client_fd);
             continue;
         }
 

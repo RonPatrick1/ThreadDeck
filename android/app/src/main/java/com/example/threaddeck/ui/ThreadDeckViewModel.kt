@@ -220,10 +220,14 @@ class ThreadDeckViewModel(application: Application) :
   CodexAppServer.Listener {
 
   private val preferences = application.getSharedPreferences("threaddeck", 0)
+  private val savedEndpoint =
+    preferences.getString("endpoint", DEFAULT_ENDPOINT)
+      ?.takeUnless { it == LEGACY_ADB_ENDPOINT }
+      ?: DEFAULT_ENDPOINT
   private val _uiState =
     MutableStateFlow(
       ThreadDeckUiState(
-        endpoint = preferences.getString("endpoint", DEFAULT_ENDPOINT) ?: DEFAULT_ENDPOINT,
+        endpoint = savedEndpoint,
         themeId = preferences.getString("theme", "midnight-ocean") ?: "midnight-ocean",
         selectedThreadId = preferences.getString("selected_thread", null),
         collapsedProjects =
@@ -1884,5 +1888,6 @@ class ThreadDeckViewModel(application: Application) :
   }
 }
 
-const val DEFAULT_ENDPOINT = "ws://127.0.0.1:4545"
+const val DEFAULT_ENDPOINT = "ws://10.77.0.1:4545"
+private const val LEGACY_ADB_ENDPOINT = "ws://127.0.0.1:4545"
 private const val TAG = "ThreadDeckTablet"

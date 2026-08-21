@@ -1252,6 +1252,53 @@ AppServerClient::JsonResult AppServerClient::list_skills(
 }
 
 
+AppServerClient::JsonResult AppServerClient::set_skill_enabled(
+    const std::string& path,
+    bool enabled,
+    int timeout_ms) {
+    JsonResult result;
+
+    if (path.empty()) {
+        result.error = "Skill path is empty";
+        return result;
+    }
+
+    auto request_result =
+        request(
+            "skills/config/write",
+            {
+                {"path", path},
+                {"enabled", enabled},
+            },
+            timeout_ms);
+
+    result.response =
+        std::move(request_result.response);
+    result.preceding_messages =
+        std::move(
+            request_result.preceding_messages);
+
+    if (!request_result.success) {
+        result.error =
+            std::move(request_result.error);
+        return result;
+    }
+
+    if (
+        !result.response.contains("result") ||
+        !result.response["result"].is_object()
+    ) {
+        result.error =
+            "skills/config/write response does not contain a result object";
+        return result;
+    }
+
+    result.result = result.response["result"];
+    result.success = true;
+    return result;
+}
+
+
 AppServerClient::JsonResult
 AppServerClient::run_thread_shell_command(
     const std::string& thread_id,
@@ -1535,8 +1582,8 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
     const std::string& cwd,
     int limit,
     int timeout_ms,
-    const std::string& search_term,
-    bool use_state_db_only) {
+    bool use_state_db_only,
+    const std::string& cursor) {
     ThreadListResult result;
 
     if (limit <= 0) {
@@ -1557,8 +1604,8 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
         params["cwd"] = cwd;
     }
 
-    if (!search_term.empty()) {
-        params["searchTerm"] = search_term;
+    if (!cursor.empty()) {
+        params["cursor"] = cursor;
     }
 
     auto request_result =
@@ -1613,100 +1660,6 @@ AppServerClient::ThreadListResult AppServerClient::list_threads(
         }
 
         result.threads.push_back(thread);
-    }
-
-    if (
-        response_result.contains("nextCursor") &&
-        response_result["nextCursor"].is_string()
-    ) {
-        result.next_cursor =
-            response_result["nextCursor"]
-                .get<std::string>();
-    }
-
-    result.success = true;
-    return result;
-}
-
-AppServerClient::ThreadSearchResult AppServerClient::search_threads(
-    const std::string& search_term,
-    int limit,
-    int timeout_ms,
-    const std::string& cursor) {
-    ThreadSearchResult result;
-
-    if (search_term.empty()) {
-        result.error = "thread/search requires a search term";
-        return result;
-    }
-
-    if (limit <= 0) {
-        result.error =
-            "thread/search limit must be greater than zero";
-        return result;
-    }
-
-    nlohmann::json params = {
-        {"archived", false},
-        {"limit", limit},
-        {"searchTerm", search_term},
-        {"sortDirection", "desc"},
-        {"sortKey", "recency_at"},
-    };
-
-    if (!cursor.empty()) {
-        params["cursor"] = cursor;
-    }
-
-    auto request_result =
-        request("thread/search", params, timeout_ms);
-
-    result.response =
-        std::move(request_result.response);
-    result.preceding_messages =
-        std::move(request_result.preceding_messages);
-
-    if (!request_result.success) {
-        result.error =
-            std::move(request_result.error);
-        return result;
-    }
-
-    if (
-        !result.response.contains("result") ||
-        !result.response["result"].is_object()
-    ) {
-        result.error =
-            "thread/search response does not contain a result object";
-        return result;
-    }
-
-    const auto& response_result =
-        result.response["result"];
-
-    if (
-        !response_result.contains("data") ||
-        !response_result["data"].is_array()
-    ) {
-        result.error =
-            "thread/search result does not contain a data array";
-        return result;
-    }
-
-    for (const auto& match : response_result["data"]) {
-        if (
-            !match.is_object() ||
-            !match.contains("thread") ||
-            !match["thread"].is_object() ||
-            !match["thread"].contains("id") ||
-            !match["thread"]["id"].is_string()
-        ) {
-            result.error =
-                "thread/search returned an invalid result";
-            return result;
-        }
-
-        result.matches.push_back(match);
     }
 
     if (
@@ -2584,6 +2537,18 @@ AppServerClient::run_streaming_turn_operation(
 
         const std::string method =
             message.value("method", std::string{});
+
+        if (method == "skills/changed") {
+            emit_event(
+                TurnEvent::Type::SkillsChanged,
+                thread_id,
+                result.turn_id,
+                {},
+                {},
+                nlohmann::json{},
+                message);
+            continue;
+        }
 
         if (
             (

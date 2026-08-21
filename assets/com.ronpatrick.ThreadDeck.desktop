@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=ThreadDeck
-Comment=Codex thread deck
+Comment=Native Codex desktop client
 Exec=/usr/bin/env PATH=/home/ronpatrick/.nvm/versions/node/v22.22.2/bin:/home/ronpatrick/.cargo/bin:/home/ronpatrick/.local/bin:/home/ronpatrick/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/ronpatrick/.local/share/JetBrains/Toolbox/scripts /var/www/CodexNativeUbuntu/build/threaddeck
-Icon=/var/www/CodexNativeUbuntu/assets/icons/threaddeck.svg
+Icon=/var/www/CodexNativeUbuntu/assets/icons/threaddeck.png
 Terminal=false
 Categories=Development;
+StartupNotify=true
 StartupWMClass=com.ronpatrick.ThreadDeck
